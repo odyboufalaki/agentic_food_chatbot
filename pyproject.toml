@@ -1,0 +1,18 @@
+[project]
+name = "food-ordering-chatbot"
+version = "0.1.0"
+description = "A conversational, deterministically priced food-order draft"
+requires-python = ">=3.13"
+dependencies = ["mistralai>=2,<3", "pydantic>=2,<3", "pyyaml>=6,<7", "httpx>=0.28,<1"]
+
+[dependency-groups]
+dev = ["pytest>=8", "mypy>=1", "types-PyYAML>=6"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+files = ["agent.py", "main.py", "food_ordering"]
