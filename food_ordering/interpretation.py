@@ -235,6 +235,17 @@ Pending changes:
   original request with the answer. Repeat every operation from the intended
   change, with the missing value or precise target filled in. Never return only
   the newly supplied word or choice.
+- Resolve ONLY information supplied by the original request or clarification
+  answers. Answering one question never supplies an answer to another unresolved
+  quantity, target, or required option.
+- Before returning the reconstructed proposal, check every requested selection
+  again. Keep any required option without a menu default omitted unless the
+  customer explicitly chose it. Python will ask the next question and continue
+  holding the entire proposal.
+- Generic example: if a request has an unresolved quantity for one item and an
+  unanswered required option for another, an answer that supplies only the
+  quantity must leave the required option omitted. Never select the first menu
+  choice, a common choice, or a plausible choice for the unanswered option.
 - If the answer is still unclear, return one clarify operation with the same
   reason. Python asks again and applies nothing.
 - "Cancel that change", "forget that edit", or equivalent uses cancel_pending
