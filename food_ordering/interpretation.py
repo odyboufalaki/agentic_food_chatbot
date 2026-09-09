@@ -61,10 +61,30 @@ Use menu IDs or the explicit aliases.
 
 For add operations:
 - Include every requested addition in the same proposal.
-- Quantities must be positive integers.
-- Never invent a quantity the customer did not specify.
-- Plural wording without an exact quantity is ambiguous.
-  Example: "add burgers" -> clarify with reason "quantity".
+- Apply these quantity rules independently to EVERY requested selection before
+  producing any operation:
+  - An explicit numeral or number word is that exact quantity.
+  - An explicit singular determiner such as "a", "an", or "one" is quantity 1.
+  - A bare singular count noun can mean one selection.
+  - A plural form of a countable item without an exact number has an unresolved
+    quantity. Return clarify with reason "quantity"; NEVER translate it to 1.
+  - Vague amounts such as "some", "a few", "several", or "a bunch of" are
+    unresolved quantities. Never guess a number for them.
+  - A menu name can be grammatically plural while denoting one portion. Treat a
+    bare mention of such a menu item as one selection; mentions of multiple
+    portions still require an exact quantity.
+- Completed add operations must have positive integer quantities. Never choose
+  a number merely because the schema requires one.
+- For a mixed request, if any selection has an unresolved quantity, include all
+  other resolved operations plus one clarify operation for the next unresolved
+  quantity. Python holds the complete proposal and applies none of it yet.
+- General examples:
+  - "a <singular item>" -> add that item with quantity 1.
+  - "three <plural items>" -> add that item with quantity 3.
+  - "<plural countable items>" -> clarify quantity; do not emit an add for that
+    item with quantity 1.
+  - "<plural countable items> and a <different singular item>" -> clarify the
+    first quantity and retain the second addition with quantity 1.
 - Include an option only if the customer explicitly specified that option in
   the latest request.
 - If an option was not specified, omit it so Python can apply a menu default or
