@@ -2,8 +2,10 @@ import asyncio
 import json
 import math
 import os
+import re
 from dataclasses import dataclass
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal, Protocol
 
 import httpx
@@ -11,6 +13,8 @@ from jsonschema.validators import validator_for
 from mcp import ClientSession, types
 from mcp.client.streamable_http import streamable_http_client
 from referencing import Registry
+
+from food_ordering.menu import money
 
 
 ENDPOINT = "https://webviews-git-moveo-food-nlp-assignment-moveo-ai.vercel.app/api/demo/mcp"
@@ -28,7 +32,7 @@ class SubmissionSettings:
 
 @dataclass(frozen=True)
 class SubmissionResult:
-    status: Literal["submitted", "rejected", "uncertain", "not_sent"]
+    status: Literal["submitted", "rejected", "application_error", "uncertain", "not_sent"]
     invoked: bool
     result: dict[str, Any]
 
@@ -37,38 +41,65 @@ class Submitter(Protocol):
     def submit(self, payload: dict[str, Any]) -> SubmissionResult: ...
 
 
-def render_receipt(result: dict[str, Any]) -> str:
-    details = ["Order submitted!"]
-    for label, key in [("Order number", "order_id"), ("Restaurant total", "total"),
-                       ("Estimated time", "estimated_time")]:
-        if key in result:
-            value = result[key]
-            if key == "total" and isinstance(value, (int, float)) and not isinstance(value, bool):
-                value = f"${value:.2f}"
-            details.append(f"{label}: {value}")
+def render_receipt(result: dict[str, Any], reviewed_total_cents: int) -> str:
+    details = ["Order accepted and submitted!"]
+    details.append(f"Order number: {result.get('order_id', 'not provided')}")
+    details.append(f"Reviewed total: {money(reviewed_total_cents)}")
+    returned_total = result.get("total")
+    if returned_total is None:
+        details.append("Restaurant total: not provided")
+    else:
+        try:
+            amount = Decimal(str(returned_total)) * 100
+            returned_cents = int(amount) if amount.is_finite() and amount == amount.to_integral_value() else None
+        except (InvalidOperation, ValueError, TypeError):
+            returned_cents = None
+        formatted = (f"${returned_total:.2f}"
+                     if isinstance(returned_total, (int, float)) and not isinstance(returned_total, bool)
+                     else str(returned_total))
+        difference = " (differs from reviewed total)" if returned_cents != reviewed_total_cents else ""
+        details.append(f"Restaurant total: {formatted}{difference}")
+    if "estimated_time" in result:
+        details.append(f"Estimated time: {result['estimated_time']}")
     return "\n".join(details)
 
 
 def read_result(result: types.CallToolResult) -> SubmissionResult:
     is_error = result.isError
     payload = result.structuredContent
+    text_blocks = [block.text for block in result.content if isinstance(block, types.TextContent)]
     if payload is None:
-        for block in result.content:
-            if isinstance(block, types.TextContent):
-                try:
-                    decoded = json.loads(block.text)
-                except ValueError:
-                    continue
-                if isinstance(decoded, dict):
-                    payload = decoded
-                    break
+        for text in text_blocks:
+            try:
+                decoded = json.loads(text)
+            except ValueError:
+                continue
+            if isinstance(decoded, dict):
+                payload = decoded
+                break
+    if payload is not None and payload.get("success") is True:
+        status: Literal["submitted", "uncertain"] = "uncertain" if is_error else "submitted"
+        return SubmissionResult(status, True, payload)
+    if is_error and (_contains_code(payload, -32602)
+                     or any(re.search(r"(?<!\d)-32602(?!\d)", text) for text in text_blocks)):
+        preserved = payload if payload is not None else {"code": -32602, "message": "\n".join(text_blocks)}
+        return SubmissionResult("application_error", True, preserved)
     if payload is None:
-        return SubmissionResult("uncertain", True, {"client_error": "unrecognized_result", "outcome": "uncertain"})
-    if payload.get("success") is True and not is_error:
-        return SubmissionResult("submitted", True, payload)
+        return SubmissionResult("uncertain", True, {
+            "client_error": "unrecognized_result", "outcome": "uncertain",
+            "text": "\n".join(text_blocks),
+        })
     if payload.get("success") is False:
         return SubmissionResult("rejected", True, payload)
     return SubmissionResult("uncertain", True, payload)
+
+
+def _contains_code(value: object, code: int) -> bool:
+    if isinstance(value, dict):
+        return value.get("code") == code or any(_contains_code(item, code) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_code(item, code) for item in value)
+    return False
 
 
 class MCPSubmitter:
@@ -79,24 +110,30 @@ class MCPSubmitter:
         self._settings = settings if settings is not None else SubmissionSettings.from_env()
         self._transport = transport
 
-    def submit(self, payload: dict[str, Any]) -> SubmissionResult:
+    def submit(self, payload: dict[str, Any], *,
+               force_failure: Literal["kitchen_busy", "server_error"] | None = None) -> SubmissionResult:
         if (not self._settings.applicant_email.strip()
-                or not math.isfinite(self._settings.timeout_seconds) or self._settings.timeout_seconds <= 0):
+                or not math.isfinite(self._settings.timeout_seconds) or self._settings.timeout_seconds <= 0
+                or force_failure not in {None, "kitchen_busy", "server_error"}):
             return SubmissionResult("not_sent", False, {"client_error": "configuration", "outcome": "not_sent"})
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self._submit(payload))
+            return asyncio.run(self._submit(payload, force_failure=force_failure))
         return SubmissionResult("not_sent", False, {"client_error": "use_worker_thread", "outcome": "not_sent"})
 
-    async def _submit(self, payload: dict[str, Any]) -> SubmissionResult:
+    async def _submit(self, payload: dict[str, Any], *,
+                      force_failure: Literal["kitchen_busy", "server_error"] | None) -> SubmissionResult:
         invoked = False
         outcome = None
 
         async def track_request(request: httpx.Request) -> None:
             nonlocal invoked
-            if request.method == "POST" and json.loads(request.content).get("method") == "tools/call":
+            is_tool_call = request.method == "POST" and json.loads(request.content).get("method") == "tools/call"
+            if is_tool_call:
                 invoked = True
+                if force_failure is not None:
+                    request.headers["X-Demo-Force-Failure"] = force_failure
 
         try:
             async with asyncio.timeout(self._settings.timeout_seconds):

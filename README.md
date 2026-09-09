@@ -3,7 +3,7 @@
 Ask about the assignment menu and build, edit, or clear an in-memory, priced draft
 through natural language. Python validates and prices the order; Mistral
 interprets requests into typed proposals. Review a valid order, explicitly confirm
-it, and receive a restaurant receipt through MCP (tickets 01–03).
+it, and receive a restaurant receipt through MCP (tickets 01–04).
 
 ## Setup
 
@@ -172,6 +172,10 @@ Submission is injectable with `FoodOrderAgent(submitter=...)`. The synchronous
 rejection, uncertainty, or failure before invocation. `MCPSubmitter(transport=...)`
 accepts a controlled HTTPX async transport for tests; the adapter closes it.
 `SubmissionSettings` can configure the applicant identity and timeout in code.
+For the assignment's controlled failure demonstration only,
+`MCPSubmitter.submit(payload, force_failure="kitchen_busy")` or `"server_error"`
+adds `X-Demo-Force-Failure` to that tool-call request. It is never retained on
+the client, sent during initialization, or inferred from customer language.
 
 Async hosts must run `send` in a worker thread (for example,
 `await asyncio.to_thread(agent.send, message)`) and serialize calls per agent.
@@ -220,17 +224,28 @@ This slice adds, edits, and removes selections, clears unsubmitted drafts,
 answers menu questions, reviews and submits confirmed orders. Splitting some servings into another
 configuration, changing multiple matching lines as a group, grouping identical
 displayed lines, product replacement, preparation instructions, pending clarification
-continuation, and detailed rejection/retry recovery are later tickets.
+continuation are later tickets.
 If a required choice is missing, such as milkshake flavor, the whole message is
 rejected with choices and a request to restate it completely. An over-$50 draft
 stays open to additions and edits, but cannot be submitted until within the limit.
 
-Explicit rejection preserves the selections and server explanation. This slice
-does not offer unchanged retries; ticket 04 adds customer-requested retry handling.
-A lost or unrecognized result may mean the order was accepted, so uncertainty
-blocks resubmission and new-order reset within the session. Receipt details already
-received survive cleanup or logging failures. Detailed receipt discrepancy handling
-also belongs to ticket 04.
+Explicit rejection preserves the selections and server explanation without
+claiming whether retry will help. It never triggers an automatic call. An explicit
+"try again" authorizes one call against the same frozen payload. Editing after a
+rejection returns the order to draft state, so retry intent presents a fresh review
+and requires confirmation. A schema-validation response carrying JSON-RPC code
+`-32602` is an application error and cannot retry unchanged.
+
+The adapter inspects `isError` before interpreting content, prefers structured
+content, and falls back to JSON text. `success: false` is an explicit rejection
+with or without `isError`. Contradictory success/error flags and malformed results
+are uncertain. A lost or unrecognized result may mean the order was accepted, so
+uncertainty blocks resubmission and new-order reset within the session.
+
+Clear acceptance remains accepted when receipt fields are absent or the returned
+total differs. The receipt displays the reviewed total, any restaurant total and
+the discrepancy; the locally reviewed price remains unchanged. Receipt details
+already received survive cleanup or logging failures and no second call is made.
 
 Instances are in-memory and calls per instance must be serialized. Restarting
 loses the draft and duplicate-submission protection; there is no cross-restart

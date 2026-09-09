@@ -61,6 +61,10 @@ class NewOrder(StrictModel):
     type: Literal["new_order"]
 
 
+class RetrySubmission(StrictModel):
+    type: Literal["retry_submission"]
+
+
 class MenuQuestion(StrictModel):
     type: Literal["menu"]
     item_ids: list[str] = Field(default_factory=list)
@@ -72,7 +76,7 @@ class Unsupported(StrictModel):
 
 
 Operation = Annotated[
-    Add | Edit | RemoveLine | ChangeQuantity | ClearDraft | Submit | Review | NewOrder | Summary | MenuQuestion | Unsupported,
+    Add | Edit | RemoveLine | ChangeQuantity | ClearDraft | Submit | Review | NewOrder | RetrySubmission | Summary | MenuQuestion | Unsupported,
     Field(discriminator="type"),
 ]
 

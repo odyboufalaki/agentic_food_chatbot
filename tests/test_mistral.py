@@ -27,7 +27,8 @@ def test_adapter_accepts_draft_edits_and_supplies_surviving_line_ids(tmp_path):
         context = json.loads(body["messages"][0]["content"].split("Current application data:\n", 1)[1])
         contexts.append(context)
         schema = body["response_format"]["json_schema"]["schema"]
-        assert {"edit", "set_quantity", "increase_quantity", "remove_units", "remove_line", "clear_draft"} <= set(
+        assert {"edit", "set_quantity", "increase_quantity", "remove_units", "remove_line", "clear_draft",
+                "retry_submission"} <= set(
             schema["properties"]["operations"]["items"]["discriminator"]["mapping"]
         )
         if len(contexts) == 1:

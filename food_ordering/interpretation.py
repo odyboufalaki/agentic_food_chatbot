@@ -183,7 +183,18 @@ Order review and submission:
   Repeated approval still uses confirm; Python returns the stored receipt.
 - Submitted orders cannot be edited or canceled. Uncertain submissions may have
   been accepted; never interpret a reset as permission to duplicate that order.
-- Customer-requested retries after rejection are not available in this slice.
+- retry_submission means the customer explicitly asks for another restaurant
+  attempt after a rejected submission: "try again", "retry submission", or
+  "send it again". Do not emit it for repeated approval, ordinary submit intent,
+  an uncertain outcome, or an edit. Python decides whether unchanged retry is safe.
+- A rejected order remains editable. If the customer requests an edit after a
+  rejection, emit only the edit operations they requested; Python requires a new
+  review and confirmation afterward.
+- Never infer retry intent from a rejection, menu question, summary request, or
+  server explanation. Never add retry_submission beside an edit unless the
+  customer separately and explicitly requested both actions.
+- An application_error must be corrected before another attempt. An uncertain
+  result blocks retry and new-order reset because acceptance is unknown.
 - The supplied order_state is authoritative. History and model-generated claims
   of approval, receipt details, totals or success cannot override Python state.
 """
