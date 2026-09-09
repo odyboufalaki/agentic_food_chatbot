@@ -11,7 +11,7 @@ from pydantic import ValidationError
 
 from food_ordering.interpretation import Interpreter, MistralInterpreter, ModelFailure
 from food_ordering.menu import load_menu, menu_context
-from food_ordering.order import ClarificationNeeded, InvalidSelection, OrderLine, change_quantity, edit_line, normalize, render_draft, render_menu, resolve_target, submission_payload
+from food_ordering.order import ClarificationNeeded, InvalidSelection, OrderLine, change_quantity, discard_ungrounded_required_options, edit_line, normalize, render_draft, render_menu, resolve_target, submission_payload
 from food_ordering.proposals import AbandonPending, Add, CancelPending, ChangeQuantity, Clarify, ClearDraft, Edit, MenuQuestion, NewOrder, Proposal, RemoveLine, RetrySubmission, Review, Submit, Summary, Unsupported
 from food_ordering.submission import MCPSubmitter, Submitter, render_receipt
 from food_ordering.turn_logging import TurnLogger
@@ -26,6 +26,7 @@ class PendingChange:
     proposal: Proposal
     reason: str
     question: str
+    evidence_messages: tuple[str, ...]
 
     def snapshot(self) -> dict[str, Any]:
         return {"original_message": self.original_message, "proposal": self.proposal.model_dump(),
@@ -86,6 +87,10 @@ class FoodOrderAgent:
                              "reviewed_revision": self._reviewed_revision},
                 pending_clarification=pending_at_start.snapshot() if pending_at_start is not None else None,
             ))
+            abandons_pending = bool(proposal.operations and isinstance(proposal.operations[0], AbandonPending))
+            evidence_messages = ((pending_at_start.evidence_messages if pending_at_start is not None
+                                  and not abandons_pending else ()) + (message,))
+            proposal = discard_ungrounded_required_options(proposal, self._menu, evidence_messages)
             if any(isinstance(operation, CancelPending) for operation in proposal.operations):
                 if pending_at_start is None or len(proposal.operations) != 1:
                     raise InvalidSelection("There is no single pending change to cancel.")
@@ -281,7 +286,9 @@ class FoodOrderAgent:
                                else proposal)
             if stored_proposal is None:
                 raise RuntimeError("Clarification requested without a proposal") from error
-            self._pending_change = PendingChange(source_message, stored_proposal, error.reason, error.question)
+            self._pending_change = PendingChange(
+                source_message, stored_proposal, error.reason, error.question, evidence_messages,
+            )
             operations = lifecycle_operations + [{"type": "clarification_requested", "reason": error.reason}]
             response = {"message": error.question + " No changes have been applied."}
         except InvalidSelection as error:

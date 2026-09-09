@@ -12,7 +12,9 @@ def test_success_and_invalid_turns_are_logged_with_normalized_operations(tmp_pat
         {"operations": [add("fries"), add("milkshake", options={"flavor": "vanilla bean"})]},
         {"operations": [{"type": "summary"}]},
     ), log_path=path)
-    responses = [agent.send(message) for message in ["Burger with cheese", "Another burger", "Fries and shake", "Show draft"]]
+    responses = [agent.send(message) for message in [
+        "Burger with cheese", "Another burger", "Fries and a vanilla bean shake", "Show draft",
+    ]]
     records = [json.loads(line) for line in path.read_text().splitlines()]
     assert len(records) == 4
     assert len({record["session_id"] for record in records}) == 1
