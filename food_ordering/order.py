@@ -1,5 +1,4 @@
-from dataclasses import dataclass, field, replace
-from uuid import uuid4
+from dataclasses import dataclass, replace
 from typing import Any
 
 from food_ordering.menu import ALIASES, Menu, money
@@ -74,7 +73,7 @@ class OrderLine:
     options: tuple[tuple[str, str], ...]
     extras: tuple[str, ...]
     unit_cents: int
-    line_id: str = field(default_factory=lambda: uuid4().hex)
+    line_id: str
     instructions: str = ""
 
     @property
@@ -90,7 +89,7 @@ class OrderLine:
         }
 
 
-def normalize(selection: Add, menu: Menu) -> OrderLine:
+def normalize(selection: Add, menu: Menu, *, line_id: str) -> OrderLine:
     item_id = ALIASES.get(selection.item_id, selection.item_id)
     item = next((item for item in menu.menu if item.id == item_id), None)
     if item is None:
@@ -118,7 +117,7 @@ def normalize(selection: Add, menu: Menu) -> OrderLine:
     if not set(extras) <= extra_prices.keys():
         raise InvalidSelection(f"Unsupported extra for {item.name}. Please choose a listed extra.")
     price += sum(extra_prices[extra] for extra in extras)
-    return OrderLine(item.id, item.name, selection.quantity, tuple(options.items()), extras, price)
+    return OrderLine(item.id, item.name, selection.quantity, tuple(options.items()), extras, price, line_id)
 
 
 def resolve_target(target: Target, lines: list[OrderLine]) -> OrderLine:
@@ -158,8 +157,8 @@ def edit_line(operation: Edit, line: OrderLine, menu: Menu) -> OrderLine:
         type="add", item_id=line.item_id, quantity=line.quantity,
         options={**dict(line.options), **operation.options},
         extras=sorted((set(line.extras) - set(operation.remove_extras)) | set(operation.add_extras)),
-    ), menu)
-    return replace(updated, line_id=line.line_id, instructions=line.instructions)
+    ), menu, line_id=line.line_id)
+    return replace(updated, instructions=line.instructions)
 
 
 def change_quantity(operation: ChangeQuantity, line: OrderLine) -> OrderLine | None:
@@ -189,7 +188,7 @@ def submission_payload(lines: list[OrderLine], menu: Menu) -> dict[str, Any]:
     validated = [normalize(Add(
         type="add", item_id=line.item_id, quantity=line.quantity,
         options=dict(line.options), extras=list(line.extras),
-    ), menu) for line in lines]
+    ), menu, line_id=line.line_id) for line in lines]
     total = sum(line.total_cents for line in validated)
     if total > 5000:
         raise InvalidSelection(f"The order total is {money(total)}. Reduce it to $50.00 or less before submission.")

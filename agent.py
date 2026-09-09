@@ -50,6 +50,7 @@ class FoodOrderAgent:
                                         else TemplateClarificationRenderer())
         self._menu = load_menu()
         self._lines: list[OrderLine] = []
+        self._next_line_number = 1
         self._history: deque[dict[str, str]] = deque(maxlen=12)
         self._logger = TurnLogger(log_path)
         self._session_id = uuid4().hex
@@ -150,12 +151,14 @@ class FoodOrderAgent:
                     }
                     raise InvalidSelection(explanations[operation.reason])
             candidate = list(self._lines)
+            next_line_number = self._next_line_number
             validated_operations = []
             answers = []
             changed = False
             for operation in proposal.operations:
                 if isinstance(operation, Add):
-                    line = normalize(operation, self._menu)
+                    line = normalize(operation, self._menu, line_id=f"L{next_line_number}")
+                    next_line_number += 1
                     candidate.append(line)
                     validated_operations.append({"type": "add", **line.snapshot()})
                     changed = True
@@ -206,6 +209,7 @@ class FoodOrderAgent:
                 })
             operations = lifecycle_operations + validated_operations
             self._lines = candidate
+            self._next_line_number = next_line_number
             if changed:
                 draft_changed = True
                 self._revision += 1

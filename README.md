@@ -114,8 +114,10 @@ enforces this distinction; only `submit` or `confirm` can authorize an invocatio
   calculates totals, and renders normalized selections and menu answers.
   A message runs against a temporary draft in operation order and is fully validated
   before any change is committed. Repeated extras
-  charge once; separately added lines keep distinct stable IDs. Stored lines reserve
-  an empty item-instruction field for later work.
+  charge once; separately added lines receive short, stable session-local IDs
+  (`L1`, `L2`, ...). IDs are allocated only when an atomic change commits and are
+  never reused after a line is removed or the draft is cleared. Stored lines
+  reserve an empty item-instruction field for later work.
 - Draft changes use separate `edit`, `set_quantity`, `increase_quantity`,
   `remove_units`, `remove_line`, and `clear_draft` operations. Targets match a
   current line ID or item ID with optional current options/extras. Exactly one

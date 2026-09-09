@@ -49,7 +49,8 @@ def test_adapter_accepts_draft_edits_and_supplies_surviving_line_ids(tmp_path):
             assert "Total: $13.00" in agent.send("A large burger with cheese and bacon")["message"]
             assert "Total: $11.50" in agent.send("Remove the bacon")["message"]
             assert "Total: $0.00" in agent.send("Remove one burger")["message"]
-    assert contexts[1]["draft"][0]["line_id"] == contexts[2]["draft"][0]["line_id"]
+    assert contexts[1]["draft"][0]["line_id"] == "L1"
+    assert contexts[2]["draft"][0]["line_id"] == "L1"
     assert contexts[2]["draft"][0]["extras"] == ["cheese"]
     assert contexts[2]["draft"][0]["unit_cents"] == 1150
 

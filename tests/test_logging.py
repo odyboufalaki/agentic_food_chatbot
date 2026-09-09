@@ -22,7 +22,8 @@ def test_success_and_invalid_turns_are_logged_with_normalized_operations(tmp_pat
     assert records[0]["operations"][0]["item_id"] == "classic_burger"
     assert records[0]["operations"][0]["options"]["patty"] == "beef"
     assert records[0]["operations"][0]["extras"] == ["cheese"]
-    assert records[0]["operations"][0]["line_id"] != records[1]["operations"][0]["line_id"]
+    assert records[0]["operations"][0]["line_id"] == "L1"
+    assert records[1]["operations"][0]["line_id"] == "L2"
     assert records[0]["totals"] == {"before_cents": 0, "after_cents": 950}
     assert records[2]["totals"] == {"before_cents": 1800, "after_cents": 1800}
     assert records[2]["state_transition"]["before"] == records[2]["state_transition"]["after"]
@@ -32,6 +33,43 @@ def test_success_and_invalid_turns_are_logged_with_normalized_operations(tmp_pat
         assert record["elapsed_ms"] >= 0
         assert record["timestamp"]
         assert record["tool_calls"] == []
+
+
+def test_rejected_atomic_proposal_does_not_consume_line_ids(tmp_path):
+    path = tmp_path / "turns.jsonl"
+    agent = FoodOrderAgent(interpreter=ScriptedInterpreter(
+        {"operations": [add("fries"), add("milkshake")]},
+        {"operations": [{"type": "cancel_pending"}]},
+        {"operations": [add("burger")]},
+    ), log_path=path)
+
+    assert "No changes have been applied" in agent.send("Fries and a milkshake")["message"]
+    agent.send("Cancel that change")
+    agent.send("Add a burger")
+
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert records[0]["operations"] == [
+        {"type": "clarification_requested", "reason": "required_option"},
+    ]
+    assert records[2]["operations"][0]["line_id"] == "L1"
+
+
+def test_cleared_lines_keep_their_ids_reserved_for_the_session(tmp_path):
+    path = tmp_path / "turns.jsonl"
+    agent = FoodOrderAgent(interpreter=ScriptedInterpreter(
+        {"operations": [add("burger")]},
+        {"operations": [{"type": "clear_draft"}]},
+        {"operations": [add("fries")]},
+        {"operations": [{"type": "new_order"}, add("soda")]},
+    ), log_path=path)
+
+    for message in ["Add a burger", "Clear it", "Add fries", "Start a new order with soda"]:
+        agent.send(message)
+
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert records[0]["operations"][0]["line_id"] == "L1"
+    assert records[2]["operations"][0]["line_id"] == "L2"
+    assert records[3]["operations"][1]["line_id"] == "L3"
 
 
 def test_unexpected_failed_turn_returns_message_and_logs_no_exception_details(tmp_path, monkeypatch):

@@ -179,7 +179,10 @@ Targets:
 - A target must identify exactly one existing line. Never pick the first of
   several matching lines or add details to make an ambiguous reference unique.
 - Use a current line_id only if the customer clearly identifies that line, such
-  as "the second burger". Copy its ID from the draft; never invent IDs.
+  as "the second burger". Line IDs are short, session-local opaque identifiers.
+  Copy the exact ID from the current draft; never derive, alter, or invent one.
+  Removed and cleared line IDs are never reused, and only IDs in the current
+  draft are valid targets.
 - "the burger" with multiple burger lines is ambiguous: retain the broad target
   for Python to turn into a specific question.
 - Resolve operations in message order, using earlier changes in this proposal
@@ -270,7 +273,8 @@ Pending changes:
   return clarify. If a clarification resolves an edit and the customer also asks
   to submit, include the complete edit and submit; Python will require a new review.
 - Use line_id from the current draft when an answer such as "the second one" or
-  "the large one" uniquely identifies a line. Never invent a line ID.
+  "the large one" uniquely identifies a line. Copy the exact current ID; never
+  infer it from the ID sequence or reuse an ID from conversation history.
 - Without pending_clarification, clarify marks an incomplete quantity or target
   that Python cannot derive from a fully typed operation. Include other resolved
   operations from the same request in the proposal; Python holds all of them.

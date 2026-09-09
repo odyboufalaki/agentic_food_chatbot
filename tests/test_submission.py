@@ -278,7 +278,7 @@ def test_deterministic_submission_boundary_rejects_fifty_dollars_and_one_cent():
     # public validator with a one-cent menu boundary without changing that menu.
     menu = Menu.model_validate({"menu": [{"id": "boundary_item", "name": "Boundary item",
                                         "base_price": Decimal("50.01"), "options": {}}]})
-    line = normalize(Add(type="add", item_id="boundary_item", quantity=1), menu)
+    line = normalize(Add(type="add", item_id="boundary_item", quantity=1), menu, line_id="L1")
     with pytest.raises(InvalidSelection, match=r"\$50\.01"):
         submission_payload([line], menu)
 
