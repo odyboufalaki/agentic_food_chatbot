@@ -235,9 +235,6 @@ Pending changes:
   original request with the answer. Repeat every operation from the intended
   change, with the missing value or precise target filled in. Never return only
   the newly supplied word or choice.
-- Fill only values supported by the original request or clarification answers.
-  Resolving one question does not authorize guessing another missing value. Keep
-  every unanswered required option omitted so Python can ask the next question.
 - If the answer is still unclear, return one clarify operation with the same
   reason. Python asks again and applies nothing.
 - "Cancel that change", "forget that edit", or equivalent uses cancel_pending

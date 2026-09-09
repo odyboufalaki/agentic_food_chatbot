@@ -150,31 +150,6 @@ def test_successive_answers_retain_values_resolved_before_the_last_question(tmp_
     assert "flavor: chocolate" in resolved and "2 × French Fries" in resolved
 
 
-def test_quantity_answer_cannot_invent_an_unanswered_required_option(tmp_path):
-    interpreter = ScriptedInterpreter(
-        {"operations": [
-            {"type": "clarify", "reason": "quantity"},
-            add("milkshake", options={"flavor": "vanilla"}, extras=["cherry_on_top"]),
-        ]},
-        {"operations": [
-            add("burger"),
-            add("milkshake", options={"flavor": "vanilla"}, extras=["cherry_on_top"]),
-        ]},
-        {"operations": [
-            add("burger"),
-            add("milkshake", options={"flavor": "vanilla"}, extras=["cherry_on_top"]),
-        ]},
-    )
-    agent = FoodOrderAgent(interpreter=interpreter, log_path=tmp_path / "turns.jsonl")
-    assert "quantity" in agent.send("I want burgers and milkshake with cherry on top")["message"].lower()
-    response = agent.send("I want one burger")["message"]
-    assert "flavor" in response.lower()
-    assert "vanilla, chocolate, strawberry, oreo" in response
-    assert "No changes have been applied" in response
-    resolved = agent.send("Vanilla")["message"]
-    assert "flavor: vanilla" in resolved and "extras: cherry_on_top" in resolved
-
-
 def test_yes_and_failed_interpretation_during_clarification_never_submit(tmp_path):
     transport = RestaurantTransport()
     interpreter = CapturingInterpreter(

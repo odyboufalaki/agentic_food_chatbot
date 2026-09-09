@@ -1,10 +1,9 @@
-import re
 from dataclasses import dataclass, field, replace
 from uuid import uuid4
 from typing import Any
 
 from food_ordering.menu import ALIASES, Menu, money
-from food_ordering.proposals import Add, ChangeQuantity, Edit, Operation, Proposal, Target
+from food_ordering.proposals import Add, ChangeQuantity, Edit, Target
 
 
 class InvalidSelection(ValueError):
@@ -40,34 +39,6 @@ class OrderLine:
             "extras": list(self.extras), "instructions": self.instructions,
             "unit_cents": self.unit_cents, "total_cents": self.total_cents,
         }
-
-
-def discard_ungrounded_required_options(
-    proposal: Proposal, menu: Menu, evidence_messages: tuple[str, ...],
-) -> Proposal:
-    """Remove model-supplied required choices that the customer never stated."""
-    evidence = tuple(f" {_normalized_words(message)} " for message in evidence_messages)
-    operations: list[Operation] = []
-    for operation in proposal.operations:
-        if not isinstance(operation, Add):
-            operations.append(operation)
-            continue
-        item_id = ALIASES.get(operation.item_id, operation.item_id)
-        item = next((candidate for candidate in menu.menu if candidate.id == item_id), None)
-        options = dict(operation.options)
-        if item is not None:
-            for name, value in operation.options.items():
-                definition = item.options.get(name)
-                choice = " ".join(_normalized_words(value).split())
-                if (definition is not None and definition.required and definition.default is None
-                        and not any(f" {choice} " in message for message in evidence)):
-                    options.pop(name)
-        operations.append(operation.model_copy(update={"options": options}))
-    return Proposal(operations=operations)
-
-
-def _normalized_words(value: str) -> str:
-    return re.sub(r"[^\w]+", " ", value.casefold().replace("_", " ")).strip()
 
 
 def normalize(selection: Add, menu: Menu) -> OrderLine:

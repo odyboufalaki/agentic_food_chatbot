@@ -171,7 +171,7 @@ def test_invalid_or_ambiguous_edit_invalidates_review_even_when_draft_unchanged(
     )
     agent.send("A burger")
     agent.send("Submit")
-    assert "unchanged" in agent.send("Change my order to vanilla bean")["message"]
+    assert "unchanged" in agent.send("Change my order")["message"]
     review = agent.send("Yes")
     assert "Total: $8.50" in review["message"]
     assert transport.calls == []

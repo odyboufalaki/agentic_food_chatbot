@@ -275,7 +275,7 @@ def test_menu_questions_show_authoritative_choices_without_changing_draft(tmp_pa
 def test_menu_pricing_examples(tmp_path, selections, total, details):
     agent = FoodOrderAgent(interpreter=ScriptedInterpreter({"operations": selections}),
                            log_path=tmp_path / "turns.jsonl")
-    response = agent.send("Add these fully specified selections, including an oreo milkshake")["message"]
+    response = agent.send("Add these fully specified selections")["message"]
     assert f"Total: {total}" in response
     assert all(detail in response for detail in details)
 
