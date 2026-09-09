@@ -39,3 +39,49 @@ def test_required_python_entry_points_work_without_credentials(tmp_path):
     records = [json.loads(line) for line in (tmp_path / "turns.jsonl").read_text().splitlines()]
     assert len(records) == 2
     assert records[0]["session_id"] != records[1]["session_id"]
+
+
+def test_cli_edits_and_removals_match_logged_summaries_and_prices(tmp_path):
+    path = tmp_path / "turns.jsonl"
+    target = {"item_id": "burger"}
+    agent = FoodOrderAgent(interpreter=ScriptedInterpreter(
+        {"operations": [add("burger", options={"size": "large"}, extras=["cheese", "bacon"])]},
+        {"operations": [{"type": "edit", "target": target, "remove_extras": ["bacon"]}]},
+        {"operations": [{"type": "edit", "target": target, "options": {"size": "regular"}}]},
+        {"operations": [{"type": "edit", "target": target, "add_extras": ["cheese", "cheese"]}]},
+        {"operations": [{"type": "set_quantity", "target": target, "quantity": 6}]},
+        {"operations": [{"type": "remove_units", "target": target, "quantity": 2}]},
+        {"operations": [{"type": "increase_quantity", "target": target, "quantity": 1}]},
+        {"operations": [
+            {"type": "edit", "target": target, "remove_extras": ["cheese"]},
+            {"type": "remove_line", "target": {"item_id": "soda"}},
+        ]},
+        {"operations": [{"type": "remove_line", "target": target}]},
+        {"operations": [add("fries")]},
+        {"operations": [{"type": "clear_draft"}]},
+    ), log_path=path)
+    messages = [
+        "A large burger with cheese and bacon", "Remove the bacon", "Make the burger regular",
+        "Add cheese again", "Make that six burgers", "Remove two burgers", "One more burger",
+        "Remove the cheese and the cola", "Remove the burger line", "Add fries", "Cancel my order",
+    ]
+    output = StringIO()
+    main(agent=agent, input_stream=StringIO("\n".join([*messages, "quit", ""])), output_stream=output)
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [record["input"] for record in records] == messages
+    assert [record["totals"]["after_cents"] for record in records] == [
+        1300, 1150, 950, 950, 5700, 3800, 4750, 4750, 0, 350, 0,
+    ]
+    for record in records:
+        assert record["response"]["message"] in output.getvalue()
+        assert record["tool_calls"] == []
+    assert records[7]["error_category"] == "invalid_selection"
+    assert records[7]["operations"] == []
+    assert records[7]["state_transition"]["before"] == records[7]["state_transition"]["after"]
+    assert all(record["error_category"] is None for i, record in enumerate(records) if i != 7)
+    line_id = records[0]["operations"][0]["line_id"]
+    assert all(records[i]["operations"][0]["line_id"] == line_id for i in [1, 2, 3, 4, 5, 6, 8])
+    assert records[4]["operations"][0]["after_quantity"] == 6
+    assert records[5]["operations"][0]["after_quantity"] == 4
+    assert records[6]["operations"][0]["after_quantity"] == 5
+    assert records[10]["operations"][0]["line_ids"] == [records[9]["operations"][0]["line_id"]]

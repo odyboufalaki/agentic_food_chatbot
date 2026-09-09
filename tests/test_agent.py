@@ -20,6 +20,170 @@ def add(item_id, quantity=1, options=None, extras=None):
     }
 
 
+def test_remove_extra_reprices_the_draft(tmp_path):
+    agent = FoodOrderAgent(interpreter=ScriptedInterpreter(
+        {"operations": [add("burger", options={"size": "large"}, extras=["cheese", "bacon"])]},
+        {"operations": [{"type": "edit", "target": {"item_id": "burger"}, "remove_extras": ["bacon"]}]},
+    ), log_path=tmp_path / "turns.jsonl")
+    assert "Total: $13.00" in agent.send("A large burger with cheese and bacon")["message"]
+    edited = agent.send("Remove the bacon from my burger")["message"]
+    assert "Total: $11.50" in edited
+    assert "cheese" in edited and "bacon" not in edited
+
+
+def test_resize_then_remove_the_identified_line(tmp_path):
+    agent = FoodOrderAgent(interpreter=ScriptedInterpreter(
+        {"operations": [add("burger", options={"size": "large"}, extras=["cheese"]), add("soda")]},
+        {"operations": [{"type": "edit", "target": {"item_id": "burger"}, "options": {"size": "regular"}}]},
+        {"operations": [{"type": "remove_line", "target": {"item_id": "burger"}}]},
+    ), log_path=tmp_path / "turns.jsonl")
+    agent.send("A large burger with cheese and a cola")
+    resized = agent.send("Make the burger regular size")["message"]
+    assert "size: regular" in resized and "cheese" in resized
+    assert "Total: $11.50" in resized
+    removed = agent.send("Remove the burger")["message"]
+    assert "Classic Burger" not in removed and "Soft Drink" in removed
+    assert "Total: $2.00" in removed
+
+
+def test_set_increase_and_remove_units_can_bring_draft_under_limit(tmp_path):
+    target = {"item_id": "burger"}
+    agent = FoodOrderAgent(interpreter=ScriptedInterpreter(
+        {"operations": [add("burger", quantity=6)]},
+        {"operations": [{"type": "set_quantity", "target": target, "quantity": 2}]},
+        {"operations": [{"type": "increase_quantity", "target": target, "quantity": 3}]},
+        {"operations": [{"type": "remove_units", "target": target, "quantity": 4}]},
+        {"operations": [{"type": "remove_units", "target": target, "quantity": 1}]},
+    ), log_path=tmp_path / "turns.jsonl")
+    for message, total, quantity in [
+        ("Six burgers", "$51.00", 6),
+        ("Make that two burgers", "$17.00", 2),
+        ("Increase the burger quantity by three", "$42.50", 5),
+        ("Remove four burgers", "$8.50", 1),
+        ("Remove one burger", "$0.00", 0),
+    ]:
+        response = agent.send(message)["message"]
+        assert f"Total: {total}" in response
+        if quantity:
+            assert f"{quantity} × Classic Burger" in response
+        else:
+            assert "Classic Burger" not in response
+
+
+def test_cancel_draft_clears_it_and_later_additions_start_fresh(tmp_path):
+    agent = FoodOrderAgent(interpreter=ScriptedInterpreter(
+        {"operations": [add("burger", quantity=6), add("soda")]},
+        {"operations": [{"type": "clear_draft"}]},
+        {"operations": [{"type": "clear_draft"}]},
+        {"operations": [add("fries")]},
+    ), log_path=tmp_path / "turns.jsonl")
+    agent.send("Six burgers and a cola")
+    cleared = agent.send("Cancel my entire order")
+    assert "Total: $0.00" in cleared["message"]
+    assert "Classic Burger" not in cleared["message"]
+    assert agent.send("Clear the draft again") == cleared
+    fresh = agent.send("Add fries")["message"]
+    assert "Total: $3.50" in fresh and "Classic Burger" not in fresh
+
+
+def test_resolved_mixed_changes_apply_together_without_duplicate_extras(tmp_path):
+    target = {"item_id": "burger"}
+    agent = FoodOrderAgent(interpreter=ScriptedInterpreter(
+        {"operations": [add("burger", extras=["cheese", "bacon"])]},
+        {"operations": [
+            {"type": "edit", "target": target, "remove_extras": ["bacon"], "add_extras": ["cheese", "cheese"]},
+            {"type": "increase_quantity", "target": target, "quantity": 1},
+            add("soda"),
+        ]},
+    ), log_path=tmp_path / "turns.jsonl")
+    agent.send("A burger with cheese and bacon")
+    response = agent.send("Remove bacon, add cheese again, make it two burgers, and add a cola")["message"]
+    assert "Total: $21.00" in response
+    assert "2 × Classic Burger" in response
+    assert response.count("cheese") == 1 and "bacon" not in response
+
+
+@pytest.mark.parametrize("invalid", [
+    {"type": "edit", "target": {"item_id": "milkshake"}, "options": {"flavor": "oreo"}},
+    {"type": "remove_line", "target": {"item_id": "spicy_burger"}},
+    {"type": "remove_line", "target": {"line_id": "nonexistent"}},
+    {"type": "remove_line", "target": {}},
+    {"type": "edit", "target": {"item_id": "burger"}, "options": {"size": "giant"}},
+    {"type": "edit", "target": {"item_id": "burger"}, "options": {"flavor": "oreo"}},
+    {"type": "edit", "target": {"item_id": "burger"}, "add_extras": ["unlisted"]},
+    {"type": "edit", "target": {"item_id": "burger"}, "remove_extras": ["bacon"]},
+    {"type": "edit", "target": {"item_id": "burger"}, "add_extras": ["cheese"], "remove_extras": ["cheese"]},
+    {"type": "edit", "target": {"item_id": "burger"}},
+    {"type": "edit", "target": {"item_id": "burger"}, "item_id": "spicy_burger"},
+    {"type": "remove_units", "target": {"item_id": "burger"}, "quantity": 3},
+    {"type": "unsupported", "reason": "unclear"},
+])
+def test_invalid_mixed_edits_preserve_the_entire_draft(tmp_path, invalid):
+    agent = FoodOrderAgent(interpreter=ScriptedInterpreter(
+        {"operations": [add("burger", quantity=2, extras=["cheese"]), add("soda")]},
+        {"operations": [
+            {"type": "remove_line", "target": {"item_id": "soda"}},
+            {"type": "edit", "target": {"item_id": "burger"}, "options": {"size": "large"}},
+            invalid,
+        ]},
+        {"operations": [{"type": "summary"}]},
+    ), log_path=tmp_path / "turns.jsonl")
+    original = agent.send("Two cheeseburgers and a cola")
+    assert "unchanged" in agent.send("Remove the cola, resize the burgers and make another change")["message"]
+    assert agent.send("Show draft") == original
+
+
+@pytest.mark.parametrize("kind", ["set_quantity", "increase_quantity", "remove_units"])
+@pytest.mark.parametrize("quantity", [0, -1, True, 1.5, "2", None])
+def test_invalid_edit_quantities_never_remove_all_servings(tmp_path, kind, quantity):
+    agent = FoodOrderAgent(interpreter=ScriptedInterpreter(
+        {"operations": [add("burger", quantity=2)]},
+        {"operations": [{"type": kind, "target": {"item_id": "burger"}, "quantity": quantity}]},
+        {"operations": [{"type": "summary"}]},
+    ), log_path=tmp_path / "turns.jsonl")
+    original = agent.send("Two burgers")
+    assert "unchanged" in agent.send("Change the quantity")["message"]
+    assert agent.send("Show draft") == original
+
+
+@pytest.mark.parametrize("second_options", [{}, {"size": "large"}])
+def test_ambiguous_reference_never_selects_an_arbitrary_line(tmp_path, second_options):
+    agent = FoodOrderAgent(interpreter=ScriptedInterpreter(
+        {"operations": [add("burger"), add("burger", options=second_options)]},
+        {"operations": [{"type": "remove_units", "target": {"item_id": "burger"}, "quantity": 1}]},
+        {"operations": [{"type": "summary"}]},
+    ), log_path=tmp_path / "turns.jsonl")
+    original = agent.send("Add two separate burger selections")
+    response = agent.send("Remove one burger")["message"]
+    assert "unchanged" in response and "which" in response
+    assert agent.send("Show draft") == original
+
+
+def test_options_and_extras_identify_a_line_without_replacing_its_product(tmp_path):
+    agent = FoodOrderAgent(interpreter=ScriptedInterpreter(
+        {"operations": [add("burger"), add("burger", options={"size": "large"}, extras=["cheese"])]},
+        {"operations": [{"type": "edit", "target": {
+            "item_id": "burger", "options": {"size": "large"}, "extras": ["cheese"],
+        }, "options": {"patty": "veggie"}}]},
+    ), log_path=tmp_path / "turns.jsonl")
+    agent.send("A regular burger and a large cheeseburger")
+    response = agent.send("Make the large cheeseburger veggie")["message"]
+    assert "Total: $20.00" in response
+    assert "patty: beef" in response and "patty: veggie" in response
+    assert response.count("Classic Burger") == 2
+
+
+def test_invalid_change_after_cancellation_rolls_back_the_clear(tmp_path):
+    agent = FoodOrderAgent(interpreter=ScriptedInterpreter(
+        {"operations": [add("burger")]},
+        {"operations": [{"type": "clear_draft"}, add("milkshake")]},
+        {"operations": [{"type": "summary"}]},
+    ), log_path=tmp_path / "turns.jsonl")
+    original = agent.send("A burger")
+    assert "unchanged" in agent.send("Cancel my order and add a milkshake")["message"]
+    assert agent.send("Show draft") == original
+
+
 def test_large_burger_with_cheese_and_bacon_costs_thirteen_dollars(tmp_path):
     agent = FoodOrderAgent(
         interpreter=ScriptedInterpreter({"operations": [

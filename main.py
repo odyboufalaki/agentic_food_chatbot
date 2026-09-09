@@ -11,7 +11,7 @@ def main(
     agent = agent if agent is not None else FoodOrderAgent()
     source = input_stream if input_stream is not None else sys.stdin
     destination = output_stream if output_stream is not None else sys.stdout
-    print("Build a food-order draft. Ask for the menu, add items, or review your draft.\nType quit or exit to leave. Conversation text is logged locally.", file=destination)
+    print("Build a food-order draft. Ask for the menu, add or edit selections, remove servings, clear your draft, or review it.\nType quit or exit to leave. Conversation text is logged locally.", file=destination)
     try:
         while True:
             print("You: ", end="", file=destination, flush=True)

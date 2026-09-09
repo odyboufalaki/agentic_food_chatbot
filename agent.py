@@ -9,8 +9,8 @@ from pydantic import ValidationError
 
 from food_ordering.interpretation import Interpreter, MistralInterpreter, ModelFailure
 from food_ordering.menu import load_menu, menu_context
-from food_ordering.order import InvalidSelection, OrderLine, normalize, render_draft, render_menu
-from food_ordering.proposals import Add, MenuQuestion, Proposal, Summary, Unsupported
+from food_ordering.order import InvalidSelection, OrderLine, change_quantity, edit_line, normalize, render_draft, render_menu, resolve_target
+from food_ordering.proposals import Add, ChangeQuantity, ClearDraft, Edit, MenuQuestion, Proposal, RemoveLine, Summary, Unsupported
 from food_ordering.turn_logging import TurnLogger
 
 
@@ -42,20 +42,58 @@ class FoodOrderAgent:
             for operation in proposal.operations:
                 if isinstance(operation, Unsupported):
                     explanations = {
-                        "not_available": "That request is not available in this draft-building version. You can ask about the menu, add items, or review your draft.",
+                        "not_available": "That request is not available in this version. You can ask about the menu, add or edit selections, remove servings, clear your draft, or review it.",
                         "unclear": "Please specify the menu items and changes you want in a complete request.",
                         "dietary_guarantee": "The menu does not verify ingredients or dietary guarantees. Please check with the restaurant.",
                     }
                     raise InvalidSelection(explanations[operation.reason])
-            additions = [normalize(operation, self._menu) for operation in proposal.operations if isinstance(operation, Add)]
-            answers = [render_menu(self._menu, operation.item_ids) for operation in proposal.operations if isinstance(operation, MenuQuestion)]
-            if additions or any(isinstance(operation, Summary) for operation in proposal.operations):
-                answers.append(render_draft(self._lines + additions))
+            candidate = list(self._lines)
+            validated_operations = []
+            answers = []
+            changed = False
+            for operation in proposal.operations:
+                if isinstance(operation, Add):
+                    line = normalize(operation, self._menu)
+                    candidate.append(line)
+                    validated_operations.append({"type": "add", **line.snapshot()})
+                    changed = True
+                elif isinstance(operation, Edit):
+                    line = resolve_target(operation.target, candidate)
+                    updated = edit_line(operation, line, self._menu)
+                    candidate[candidate.index(line)] = updated
+                    validated_operations.append({"type": "edit", **updated.snapshot()})
+                    changed = True
+                elif isinstance(operation, ChangeQuantity):
+                    line = resolve_target(operation.target, candidate)
+                    resized = change_quantity(operation, line)
+                    if resized is None:
+                        candidate.remove(line)
+                    else:
+                        candidate[candidate.index(line)] = resized
+                    validated_operations.append({
+                        **operation.model_dump(), "line_id": line.line_id,
+                        "before_quantity": line.quantity, "after_quantity": resized.quantity if resized else 0,
+                    })
+                    changed = True
+                elif isinstance(operation, RemoveLine):
+                    line = resolve_target(operation.target, candidate)
+                    candidate.remove(line)
+                    validated_operations.append({"type": "remove_line", **line.snapshot()})
+                    changed = True
+                elif isinstance(operation, ClearDraft):
+                    validated_operations.append({"type": "clear_draft", "line_ids": [line.line_id for line in candidate]})
+                    candidate.clear()
+                    changed = True
+                else:
+                    if isinstance(operation, MenuQuestion):
+                        answers.append(render_menu(self._menu, operation.item_ids))
+                    validated_operations.append(operation.model_dump())
+            if changed or any(isinstance(operation, Summary) for operation in proposal.operations):
+                answers.append(render_draft(candidate))
             response = {"message": "\n\n".join(answers)}
-            operations = [{"type": "add", **line.snapshot()} for line in additions]
-            operations.extend(operation.model_dump() for operation in proposal.operations if not isinstance(operation, Add))
-            self._lines.extend(additions)
-            if additions:
+            operations = validated_operations
+            self._lines = candidate
+            if changed:
                 self._revision += 1
         except InvalidSelection as error:
             error_category = "invalid_selection"

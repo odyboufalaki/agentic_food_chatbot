@@ -1,9 +1,9 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from uuid import uuid4
 from typing import Any
 
 from food_ordering.menu import ALIASES, Menu, money
-from food_ordering.proposals import Add
+from food_ordering.proposals import Add, ChangeQuantity, Edit, Target
 
 
 class InvalidSelection(ValueError):
@@ -59,6 +59,49 @@ def normalize(selection: Add, menu: Menu) -> OrderLine:
         raise InvalidSelection(f"Unsupported extra for {item.name}. Please choose a listed extra.")
     price += sum(extra_prices[extra] for extra in extras)
     return OrderLine(item.id, item.name, selection.quantity, tuple(options.items()), extras, price)
+
+
+def resolve_target(target: Target, lines: list[OrderLine]) -> OrderLine:
+    if target.line_id is None and target.item_id is None:
+        raise InvalidSelection("Identify the item or order line you want to change.")
+    item_id = ALIASES.get(target.item_id, target.item_id) if target.item_id is not None else None
+    matches = [line for line in lines
+               if (target.line_id is None or line.line_id == target.line_id)
+               and (item_id is None or line.item_id == item_id)
+               and target.options.items() <= dict(line.options).items()
+               and set(target.extras) <= set(line.extras)]
+    if not matches:
+        raise InvalidSelection("No order line matches that selection in your draft.")
+    if len(matches) != 1:
+        raise InvalidSelection("More than one order line matches. Please identify which selection to change.")
+    return matches[0]
+
+
+def edit_line(operation: Edit, line: OrderLine, menu: Menu) -> OrderLine:
+    if not operation.options and not operation.add_extras and not operation.remove_extras:
+        raise InvalidSelection("Specify the options or extras you want to change.")
+    if set(operation.add_extras) & set(operation.remove_extras):
+        raise InvalidSelection("Specify whether to add or remove each extra.")
+    if not set(operation.remove_extras) <= set(line.extras):
+        raise InvalidSelection("That extra is not selected on this order line.")
+    updated = normalize(Add(
+        type="add", item_id=line.item_id, quantity=line.quantity,
+        options={**dict(line.options), **operation.options},
+        extras=sorted((set(line.extras) - set(operation.remove_extras)) | set(operation.add_extras)),
+    ), menu)
+    return replace(updated, line_id=line.line_id, instructions=line.instructions)
+
+
+def change_quantity(operation: ChangeQuantity, line: OrderLine) -> OrderLine | None:
+    if operation.type == "set_quantity":
+        quantity = operation.quantity
+    elif operation.type == "increase_quantity":
+        quantity = line.quantity + operation.quantity
+    else:
+        if operation.quantity > line.quantity:
+            raise InvalidSelection(f"Only {line.quantity} servings are selected on that order line.")
+        quantity = line.quantity - operation.quantity
+    return replace(line, quantity=quantity) if quantity else None
 
 
 def render_draft(lines: list[OrderLine]) -> str:

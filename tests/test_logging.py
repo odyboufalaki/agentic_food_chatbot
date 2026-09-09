@@ -91,3 +91,32 @@ def test_closed_stderr_during_logging_failure_still_returns_the_draft(tmp_path):
         added = agent.send("A cola")
         assert "Total: $2.00" in added["message"]
         assert agent.send("Show draft") == added
+
+
+def test_targeting_a_line_by_id_preserves_other_lines_and_checks_all_selectors(tmp_path):
+    path = tmp_path / "turns.jsonl"
+    proposals = [{"operations": [add("burger"), add("burger"), add("soda")]}]
+
+    class ControlledInterpreter:
+        def interpret(self, **context):
+            return proposals.pop(0)
+
+    agent = FoodOrderAgent(interpreter=ControlledInterpreter(), log_path=path)
+    original = agent.send("Add a burger, another separate burger, and a cola")
+    lines = json.loads(path.read_text())["operations"]
+    proposals.extend([
+        {"operations": [{"type": "remove_line", "target": {"line_id": lines[1]["line_id"], "item_id": "soda"}}]},
+        {"operations": [{"type": "summary"}]},
+        {"operations": [{"type": "edit", "target": {"line_id": lines[1]["line_id"]}, "options": {"size": "large"}}]},
+        {"operations": [{"type": "remove_line", "target": {"line_id": lines[0]["line_id"]}}]},
+    ])
+    assert "unchanged" in agent.send("Remove the cola with an inconsistent identifier")["message"]
+    assert agent.send("Show draft") == original
+    edited = agent.send("Make the second burger large")["message"]
+    assert "size: regular" in edited and "size: large" in edited
+    assert "Total: $21.00" in edited
+    removed = agent.send("Remove the first burger")["message"]
+    assert "Total: $12.50" in removed
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert records[3]["operations"][0]["line_id"] == lines[1]["line_id"]
+    assert records[4]["operations"][0]["line_id"] == lines[0]["line_id"]

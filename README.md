@@ -1,8 +1,8 @@
 # Food-ordering chatbot
 
-Ticket 01: ask about the assignment menu and add fully specified selections to
-an in-memory, priced draft through natural language. Python validates and prices
-the order; Mistral interprets requests into typed proposals.
+Ask about the assignment menu and build, edit, or clear an in-memory, priced draft
+through natural language. Python validates and prices the order; Mistral
+interprets requests into typed proposals (tickets 01–02).
 
 ## Setup
 
@@ -37,6 +37,7 @@ from agent import FoodOrderAgent
 agent = FoodOrderAgent()
 response = agent.send("I'd like a large classic burger with cheese and bacon")
 print(response["message"])  # Normalized draft, total $13.00
+print(agent.send("Remove the bacon from my burger")["message"])  # $11.50
 print(agent.send("What milkshake flavors do you have?")["message"])
 print(agent.send("Show my draft")["message"])
 ```
@@ -56,10 +57,29 @@ I'd like a large classic burger with cheese and bacon
 The expected draft has a large beef Classic Burger with unique cheese and bacon
 extras, total **$13.00**. Inspect the latest record in `logs/turns.jsonl`.
 
+Continue with these requests, checking the updated draft and JSONL record each time:
+
+| Request | Expected total |
+| --- | --- |
+| Remove the bacon from my burger | $11.50 |
+| Make the burger regular size | $9.50 |
+| Add cheese to the burger again | $9.50 |
+| Make that six burgers | $57.00 |
+| Remove two burgers | $38.00 |
+| Two more of that burger | $57.00 |
+| Remove the burger line | $0.00 |
+| Add fries | $3.50 |
+| Cancel my entire order | $0.00 |
+
+For manual language evaluation, also try "take off the bacon", "make that two",
+an invalid mixed request ("make the burger large and remove the milkshake" when
+no shake is selected), and "remove the burger" with two separately added burger
+lines. Invalid or ambiguous requests must leave the entire draft unchanged.
+These are suggested live checks; automated tests use controlled model responses.
+
 For the assignment's multiple-item price, use a fresh agent and ask for a medium
 margherita with olives, large fries with parmesan, and a **large** cola: **$22.25**.
-The original example reaches that amount after a cola edit; edits belong to
-ticket 02, so this demo requests the final configuration directly.
+You can also request a default cola first and then ask to make it large.
 
 ## Design
 
@@ -72,9 +92,17 @@ ticket 02, so this demo requests the final configuration directly.
   Python revalidates typed instances as well as dictionaries.
 - `order.py`: validates item-specific options/extras, applies menu defaults,
   calculates totals, and renders normalized selections and menu answers.
-  A message is fully validated before any addition is committed. Repeated extras
+  A message runs against a temporary draft in operation order and is fully validated
+  before any change is committed. Repeated extras
   charge once; separately added lines keep distinct stable IDs. Stored lines reserve
   an empty item-instruction field for later work.
+- Draft changes use separate `edit`, `set_quantity`, `increase_quantity`,
+  `remove_units`, `remove_line`, and `clear_draft` operations. Targets match a
+  current line ID or item ID with optional current options/extras. Exactly one
+  line must match; nonexistent or ambiguous targets reject the whole message.
+  Edits preserve surviving line IDs and reprice supported choices from the menu.
+  A set quantity must be positive; zero remaining servings uses explicit line
+  removal. Removing more servings than exist is rejected.
 - `interpretation.py`: direct synchronous Mistral SDK integration using
   [custom structured output](https://docs.mistral.ai/studio/conversations/structured-output/custom).
   It receives menu data, a fresh draft snapshot, and at most six recent turns.
@@ -131,13 +159,15 @@ live-model evaluation is included in this ticket.
 
 ## Current limitations
 
-This slice adds items, answers menu questions, and displays drafts. Editing,
-removal, grouping identical displayed lines, preparation instructions, pending
-clarification continuation, confirmation, and MCP submission are later tickets.
+This slice adds, edits, and removes selections, clears unsubmitted drafts,
+answers menu questions, and displays drafts. Splitting some servings into another
+configuration, changing multiple matching lines as a group, grouping identical
+displayed lines, product replacement, preparation instructions, pending clarification
+continuation, confirmation, and MCP submission are later tickets.
 If a required choice is missing, such as milkshake flavor, the whole message is
 rejected with choices and a request to restate it completely. An over-$50 draft
-stays open to further additions; later tickets add edits and enforce the limit
-at submission. No food is ordered from a restaurant in this version.
+stays open to additions and edits; later tickets enforce the limit at submission.
+No food is ordered from a restaurant in this version.
 
 Instances are in-memory and calls per instance must be serialized. Restarting
 loses the draft. Menu data cannot establish ingredient or allergy guarantees.

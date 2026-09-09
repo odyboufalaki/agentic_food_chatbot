@@ -19,6 +19,39 @@ def completion(content):
     })
 
 
+def test_adapter_accepts_draft_edits_and_supplies_surviving_line_ids(tmp_path):
+    contexts = []
+
+    def handle(request):
+        body = json.loads(request.content)
+        context = json.loads(body["messages"][0]["content"].split("Current application data:\n", 1)[1])
+        contexts.append(context)
+        schema = body["response_format"]["json_schema"]["schema"]
+        assert {"edit", "set_quantity", "increase_quantity", "remove_units", "remove_line", "clear_draft"} <= set(
+            schema["properties"]["operations"]["items"]["discriminator"]["mapping"]
+        )
+        if len(contexts) == 1:
+            operation = {"type": "add", "item_id": "burger", "quantity": 1,
+                         "options": {"size": "large"}, "extras": ["cheese", "bacon"]}
+        elif len(contexts) == 2:
+            operation = {"type": "edit", "target": {"line_id": context["draft"][0]["line_id"]},
+                         "remove_extras": ["bacon"]}
+        else:
+            operation = {"type": "remove_units", "target": {"line_id": context["draft"][0]["line_id"]},
+                         "quantity": 1}
+        return completion(json.dumps({"operations": [operation]}))
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http_client:
+        with Mistral(api_key="test-key", client=http_client) as sdk:
+            agent = FoodOrderAgent(interpreter=MistralInterpreter(client=sdk), log_path=tmp_path / "turns.jsonl")
+            assert "Total: $13.00" in agent.send("A large burger with cheese and bacon")["message"]
+            assert "Total: $11.50" in agent.send("Remove the bacon")["message"]
+            assert "Total: $0.00" in agent.send("Remove one burger")["message"]
+    assert contexts[1]["draft"][0]["line_id"] == contexts[2]["draft"][0]["line_id"]
+    assert contexts[2]["draft"][0]["extras"] == ["cheese"]
+    assert contexts[2]["draft"][0]["unit_cents"] == 1150
+
+
 def test_mistral_sends_schema_and_context_and_returns_a_typed_proposal():
     requests = []
 
