@@ -65,6 +65,19 @@ class RetrySubmission(StrictModel):
     type: Literal["retry_submission"]
 
 
+class Clarify(StrictModel):
+    type: Literal["clarify"]
+    reason: Literal["required_option", "target", "quantity"]
+
+
+class CancelPending(StrictModel):
+    type: Literal["cancel_pending"]
+
+
+class AbandonPending(StrictModel):
+    type: Literal["abandon_pending"]
+
+
 class MenuQuestion(StrictModel):
     type: Literal["menu"]
     item_ids: list[str] = Field(default_factory=list)
@@ -76,7 +89,8 @@ class Unsupported(StrictModel):
 
 
 Operation = Annotated[
-    Add | Edit | RemoveLine | ChangeQuantity | ClearDraft | Submit | Review | NewOrder | RetrySubmission | Summary | MenuQuestion | Unsupported,
+    Add | Edit | RemoveLine | ChangeQuantity | ClearDraft | Submit | Review | NewOrder | RetrySubmission |
+    Clarify | CancelPending | AbandonPending | Summary | MenuQuestion | Unsupported,
     Field(discriminator="type"),
 ]
 

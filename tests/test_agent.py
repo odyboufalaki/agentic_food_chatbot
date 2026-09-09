@@ -132,7 +132,11 @@ def test_invalid_mixed_edits_preserve_the_entire_draft(tmp_path, invalid):
         {"operations": [{"type": "summary"}]},
     ), log_path=tmp_path / "turns.jsonl")
     original = agent.send("Two cheeseburgers and a cola")
-    assert "unchanged" in agent.send("Remove the cola, resize the burgers and make another change")["message"]
+    failed = agent.send("Remove the cola, resize the burgers and make another change")["message"]
+    if invalid == {"type": "remove_line", "target": {}}:
+        assert "which" in failed.lower() and "No changes have been applied" in failed
+    else:
+        assert "unchanged" in failed
     assert agent.send("Show draft") == original
 
 
@@ -158,7 +162,7 @@ def test_ambiguous_reference_never_selects_an_arbitrary_line(tmp_path, second_op
     ), log_path=tmp_path / "turns.jsonl")
     original = agent.send("Add two separate burger selections")
     response = agent.send("Remove one burger")["message"]
-    assert "unchanged" in response and "which" in response
+    assert "No changes have been applied" in response and "which" in response.lower()
     assert agent.send("Show draft") == original
 
 
@@ -183,7 +187,8 @@ def test_invalid_change_after_cancellation_rolls_back_the_clear(tmp_path):
         {"operations": [{"type": "summary"}]},
     ), log_path=tmp_path / "turns.jsonl")
     original = agent.send("A burger")
-    assert "unchanged" in agent.send("Cancel my order and add a milkshake")["message"]
+    response = agent.send("Cancel my order and add a milkshake")["message"]
+    assert "flavor" in response and "No changes have been applied" in response
     assert agent.send("Show draft") == original
 
 
@@ -210,7 +215,6 @@ def test_large_burger_with_cheese_and_bacon_costs_thirteen_dollars(tmp_path):
     add("fries", options={"patty": "beef"}),
     add("classic_burger", options={"size": "giant"}),
     add("soda", extras=["bacon"]),
-    add("milkshake"),
     add("fries", quantity=0),
     add("fries", quantity=-1),
     add("fries", quantity=True),

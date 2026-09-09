@@ -161,7 +161,7 @@ def test_approval_plus_edit_requires_confirmation_of_the_updated_review(tmp_path
     {"operations": [{"type": "edit", "target": {"item_id": "burger"}, "options": {"size": "giant"}}]},
     {"operations": [{"type": "unsupported", "reason": "unclear"}]},
     {"operations": [{"type": "remove_units", "target": {"item_id": "burger"}, "quantity": True}]},
-    {"operations": [{"type": "confirm"}, add("milkshake")]},
+    {"operations": [{"type": "confirm"}, add("milkshake", options={"flavor": "vanilla bean"})]},
 ])
 def test_invalid_or_ambiguous_edit_invalidates_review_even_when_draft_unchanged(tmp_path, invalid):
     transport = RestaurantTransport()
@@ -238,7 +238,7 @@ def test_empty_or_incomplete_order_never_reaches_restaurant(tmp_path):
     )
     assert "empty" in agent.send("Submit")["message"]
     assert "flavor" in agent.send("Add a milkshake")["message"]
-    assert "empty" in agent.send("Yes")["message"]
+    assert "flavor" in agent.send("Yes")["message"]
     assert transport.requests == []
 
 

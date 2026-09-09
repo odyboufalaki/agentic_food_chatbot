@@ -126,8 +126,10 @@ enforces this distinction; only `submit` or `confirm` can authorize an invocatio
 - `interpretation.py`: direct synchronous Mistral SDK integration using
   [custom structured output](https://docs.mistral.ai/studio/conversations/structured-output/custom).
   It receives menu data, a fresh draft snapshot, submission status, current and
-  reviewed revisions, and at most six recent turns.
-  There is no pending clarification in this slice. SDK retries are explicitly
+  reviewed revisions, any pending clarification, and at most six recent turns.
+  A pending proposal remains separate from the draft until a direct answer
+  completes it; Python then revalidates and applies the entire proposal atomically.
+  SDK retries are explicitly
   disabled; each turn permits an initial request and one transient retry or one
   schema repair, with a 20-second timeout per request. Authentication/configuration
   failures are not retried. The
@@ -161,8 +163,8 @@ are never used as authoritative output.
 
 External interpretation is injectable with `FoodOrderAgent(interpreter=...)`.
 Its `interpret` method accepts keyword arguments `message`, `menu`, `draft`,
-`history`, and `order_state`, returning a `Proposal` or an equivalent dictionary
-that Python validates.
+`history`, `order_state`, and `pending_clarification`, returning a `Proposal` or
+an equivalent dictionary that Python validates.
 To test the real adapter without network access, pass a Mistral SDK client with a
 controlled HTTP transport to `MistralInterpreter(client=...)`. Injected clients
 are owned by the caller; default clients are closed after each interpretation.
@@ -221,12 +223,12 @@ tested at the public deterministic submission validator using a boundary menu.
 ## Current limitations
 
 This slice adds, edits, and removes selections, clears unsubmitted drafts,
-answers menu questions, reviews and submits confirmed orders. Splitting some servings into another
-configuration, changing multiple matching lines as a group, grouping identical
-displayed lines, product replacement, preparation instructions, pending clarification
-continuation are later tickets.
-If a required choice is missing, such as milkshake flavor, the whole message is
-rejected with choices and a request to restate it completely. An over-$50 draft
+answers menu questions, resolves missing choices and ambiguous changes, reviews,
+and submits confirmed orders. Splitting some servings into another configuration,
+changing multiple matching lines as a group, grouping identical displayed lines,
+product replacement, and preparation instructions are later tickets.
+If a required choice is missing, such as milkshake flavor, the whole proposal is
+held until the customer answers or cancels it. An over-$50 draft
 stays open to additions and edits, but cannot be submitted until within the limit.
 
 Explicit rejection preserves the selections and server explanation without

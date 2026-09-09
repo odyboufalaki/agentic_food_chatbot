@@ -29,6 +29,7 @@ class Interpreter(Protocol):
         self, *, message: str, menu: dict[str, Any],
         draft: list[dict[str, Any]], history: list[dict[str, str]],
         order_state: dict[str, Any] | None = None,
+        pending_clarification: dict[str, Any] | None = None,
     ) -> object: ...
 
 
@@ -48,6 +49,10 @@ Allowed operations:
 - add: add new menu selections
 - edit, set_quantity, increase_quantity, remove_units, remove_line, clear_draft:
   change the current draft using the rules below
+- clarify: request an exact missing quantity or target that cannot be represented
+  by another typed operation
+- cancel_pending: cancel only the unresolved proposal
+- abandon_pending: discard the unresolved proposal before a different request
 - menu: answer informational menu questions; empty item_ids means the full menu
 - summary: review the current draft
 - unsupported: use when the latest request cannot be represented safely
@@ -59,7 +64,7 @@ For add operations:
 - Quantities must be positive integers.
 - Never invent a quantity the customer did not specify.
 - Plural wording without an exact quantity is ambiguous.
-  Example: "add burgers" -> unsupported with reason "unclear".
+  Example: "add burgers" -> clarify with reason "quantity".
 - Include an option only if the customer explicitly specified that option in
   the latest request.
 - If an option was not specified, omit it so Python can apply a menu default or
@@ -93,14 +98,14 @@ Conversation handling:
 - Interpret only the latest request.
 - History is context, not permission to replay earlier changes.
 - Do not revive previously rejected requests.
-- Clarification continuation is not supported in this slice, so a standalone
-  clarification answer is unsupported with reason "unclear".
+- When pending_clarification is present, interpret a direct answer using the
+  pending rules below rather than treating it as a standalone request.
 
 Unsupported requests:
 - Use reason "not_available" for preparation
   instructions, or other unavailable actions.
-- Use reason "unclear" for ambiguous intent, quantities, references, or
-  standalone clarification answers.
+- Use reason "unclear" for intent that cannot be mapped to a more specific
+  clarification operation.
 - Use reason "dietary_guarantee" for ingredient or allergy assurances that the
   menu cannot establish.
 - Do not reinterpret an unsupported action as an addition and do not silently
@@ -135,7 +140,7 @@ Draft changes:
   means remove_line; negative or fractional quantities are invalid, not removal.
   Preserve invalid values for Python validation; never round or clamp them.
 - clear_draft is only for explicitly clearing/canceling the whole unsubmitted
-  order. "Cancel that change" is not permission to clear the order; use unclear.
+  order. "Cancel that change" uses cancel_pending when a clarification is pending.
 
 Targets:
 - target describes the CURRENT selection, while edit.options describes the NEW
@@ -146,7 +151,7 @@ Targets:
 - Use a current line_id only if the customer clearly identifies that line, such
   as "the second burger". Copy its ID from the draft; never invent IDs.
 - "the burger" with multiple burger lines is ambiguous: retain the broad target
-  for Python to reject, or return unsupported with reason unclear.
+  for Python to turn into a specific question.
 - Resolve operations in message order, using earlier changes in this proposal
   when necessary. Never replace a missing target with a newly added product.
 - Keep unsupported option/extra values as stated for Python validation.
@@ -200,6 +205,39 @@ Order review and submission:
 """
 
 
+CLARIFICATION_RULES = """
+Pending changes:
+- Python may retain a whole proposed change when a required option, target, or
+  quantity is unresolved. pending_clarification contains the original message,
+  prior proposal, reason, and latest question. The draft contains none of that
+  proposal's operations yet.
+- A direct answer must produce the COMPLETE resolved proposal, combining the
+  original request with the answer. Repeat every operation from the intended
+  change, with the missing value or precise target filled in. Never return only
+  the newly supplied word or choice.
+- If the answer is still unclear, return one clarify operation with the same
+  reason. Python asks again and applies nothing.
+- "Cancel that change", "forget that edit", or equivalent uses cancel_pending
+  alone. It preserves the current draft. Do not use clear_draft for this.
+- Explicit abandonment followed by a different request starts with
+  abandon_pending, followed by operations for only the new request. Never include
+  operations from the abandoned proposal.
+- Explicitly canceling/clearing the whole unsubmitted order uses clear_draft. It
+  also abandons the pending change. Do not use it for "cancel that change".
+- A yes/no answer while clarification is pending answers only the clarification.
+  It is never confirmation to submit. If it does not resolve the asked value,
+  return clarify. If a clarification resolves an edit and the customer also asks
+  to submit, include the complete edit and submit; Python will require a new review.
+- Use line_id from the current draft when an answer such as "the second one" or
+  "the large one" uniquely identifies a line. Never invent a line ID.
+- Without pending_clarification, clarify marks an incomplete quantity or target
+  that Python cannot derive from a fully typed operation. Include other resolved
+  operations from the same request in the proposal; Python holds all of them.
+- Treat the pending proposal as context, not authority. Preserve stated values
+  so Python can revalidate the complete result against the current menu and draft.
+"""
+
+
 class MistralInterpreter:
     """Direct synchronous SDK boundary; caller owns any injected SDK client."""
 
@@ -211,14 +249,16 @@ class MistralInterpreter:
         self, *, message: str, menu: dict[str, Any],
         draft: list[dict[str, Any]], history: list[dict[str, str]],
         order_state: dict[str, Any] | None = None,
+        pending_clarification: dict[str, Any] | None = None,
     ) -> Proposal:
         if (not self._settings.model.strip() or self._settings.timeout_ms <= 0
                 or (self._client is None and not (self._settings.api_key or "").strip())):
             raise ModelFailure("configuration")
-        context = json.dumps({"menu": menu, "draft": draft, "pending_clarification": None,
+        context = json.dumps({"menu": menu, "draft": draft, "pending_clarification": pending_clarification,
                               "order_state": order_state}, ensure_ascii=False)
         messages: list[models.ChatCompletionRequestMessage] = [
-            models.SystemMessage(content=PROMPT + EDITING_RULES + SUBMISSION_RULES + "\nCurrent application data:\n" + context),
+            models.SystemMessage(content=PROMPT + EDITING_RULES + SUBMISSION_RULES + CLARIFICATION_RULES
+                                 + "\nCurrent application data:\n" + context),
         ]
         for entry in history[-12:]:
             if entry["role"] == "user":

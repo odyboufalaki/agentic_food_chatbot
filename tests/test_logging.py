@@ -9,7 +9,7 @@ def test_success_and_invalid_turns_are_logged_with_normalized_operations(tmp_pat
     agent = FoodOrderAgent(interpreter=ScriptedInterpreter(
         {"operations": [add("burger", extras=["cheese", "cheese"])]},
         {"operations": [add("burger")]},
-        {"operations": [add("fries"), add("milkshake")]},
+        {"operations": [add("fries"), add("milkshake", options={"flavor": "vanilla bean"})]},
         {"operations": [{"type": "summary"}]},
     ), log_path=path)
     responses = [agent.send(message) for message in ["Burger with cheese", "Another burger", "Fries and shake", "Show draft"]]

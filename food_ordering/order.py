@@ -10,6 +10,13 @@ class InvalidSelection(ValueError):
     pass
 
 
+class ClarificationNeeded(InvalidSelection):
+    def __init__(self, reason: str, question: str) -> None:
+        self.reason = reason
+        self.question = question
+        super().__init__(question)
+
+
 @dataclass(frozen=True)
 class OrderLine:
     item_id: str
@@ -47,7 +54,9 @@ def normalize(selection: Add, menu: Menu) -> OrderLine:
         value = selection.options.get(name, option.default)
         if value is None:
             if option.required:
-                raise InvalidSelection(f"Choose {name} for {item.name}: {', '.join(option.choices)}.")
+                raise ClarificationNeeded(
+                    "required_option", f"Choose {name} for {item.name}: {', '.join(option.choices)}.",
+                )
             continue
         if value not in option.choices:
             raise InvalidSelection(f"Choose a supported {name} for {item.name}: {', '.join(option.choices)}.")
@@ -63,7 +72,7 @@ def normalize(selection: Add, menu: Menu) -> OrderLine:
 
 def resolve_target(target: Target, lines: list[OrderLine]) -> OrderLine:
     if target.line_id is None and target.item_id is None:
-        raise InvalidSelection("Identify the item or order line you want to change.")
+        raise ClarificationNeeded("target", "Which item or order line do you want to change?")
     item_id = ALIASES.get(target.item_id, target.item_id) if target.item_id is not None else None
     matches = [line for line in lines
                if (target.line_id is None or line.line_id == target.line_id)
@@ -73,7 +82,11 @@ def resolve_target(target: Target, lines: list[OrderLine]) -> OrderLine:
     if not matches:
         raise InvalidSelection("No order line matches that selection in your draft.")
     if len(matches) != 1:
-        raise InvalidSelection("More than one order line matches. Please identify which selection to change.")
+        choices = "; ".join(
+            f"{index}: {line.quantity} × {line.name} ({', '.join(f'{key}: {value}' for key, value in line.options)})"
+            for index, line in enumerate(matches, start=1)
+        )
+        raise ClarificationNeeded("target", f"Which matching selection do you mean? {choices}.")
     return matches[0]
 
 

@@ -28,7 +28,7 @@ def test_adapter_accepts_draft_edits_and_supplies_surviving_line_ids(tmp_path):
         contexts.append(context)
         schema = body["response_format"]["json_schema"]["schema"]
         assert {"edit", "set_quantity", "increase_quantity", "remove_units", "remove_line", "clear_draft",
-                "retry_submission"} <= set(
+                "retry_submission", "clarify", "cancel_pending", "abandon_pending"} <= set(
             schema["properties"]["operations"]["items"]["discriminator"]["mapping"]
         )
         if len(contexts) == 1:
@@ -68,6 +68,12 @@ def test_mistral_sends_schema_and_context_and_returns_a_typed_proposal():
                 draft=[{"item_id": "soda", "quantity": 1}],
                 history=[{"role": "user", "content": "A cola"}],
                 order_state={"status": "draft", "revision": 1, "reviewed_revision": 1},
+                pending_clarification={
+                    "original_message": "Add a milkshake", "proposal": {"operations": [
+                        {"type": "add", "item_id": "milkshake", "quantity": 1,
+                         "options": {}, "extras": []},
+                    ]}, "reason": "required_option", "question": "Which flavor?",
+                },
             )
     assert isinstance(proposal, Proposal)
     assert proposal.operations[0].type == "summary"
@@ -79,7 +85,8 @@ def test_mistral_sends_schema_and_context_and_returns_a_typed_proposal():
     assert request["messages"][-1]["content"] == "What is in my draft?"
     context = request["messages"][0]["content"]
     assert '"item_id": "soda"' in context
-    assert '"pending_clarification": null' in context
+    assert '"original_message": "Add a milkshake"' in context
+    assert '"reason": "required_option"' in context
     assert '"reviewed_revision": 1' in context
     assert request["messages"][-2]["content"] == "A cola"
 
