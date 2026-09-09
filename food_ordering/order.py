@@ -10,11 +10,60 @@ class InvalidSelection(ValueError):
     pass
 
 
+@dataclass(frozen=True)
+class ClarificationContext:
+    reason: str
+    fallback_question: str
+    subject: str | None = None
+    field: str | None = None
+    choices: tuple[str, ...] = ()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "reason": self.reason, "subject": self.subject, "field": self.field,
+            "choices": list(self.choices), "draft_changed": False,
+        }
+
+
 class ClarificationNeeded(InvalidSelection):
-    def __init__(self, reason: str, question: str) -> None:
-        self.reason = reason
-        self.question = question
-        super().__init__(question)
+    def __init__(self, context: ClarificationContext) -> None:
+        self.context = context
+        super().__init__(context.fallback_question)
+
+
+def build_clarification_context(
+    reason: str, menu: Menu, *, item_id: str | None = None, field: str | None = None,
+) -> ClarificationContext:
+    questions = {
+        "required_option": "Which required option would you like?",
+        "target": "Which selection do you mean?",
+        "quantity": "What exact quantity do you mean?",
+    }
+    resolved_id = ALIASES.get(item_id, item_id) if item_id is not None else None
+    item = next((candidate for candidate in menu.menu if candidate.id == resolved_id), None)
+    if item is None:
+        return ClarificationContext(reason=reason, fallback_question=questions[reason], field=field or reason)
+    if reason == "quantity":
+        return ClarificationContext(
+            reason=reason,
+            fallback_question=f"How many servings of {item.name} would you like?",
+            subject=item.name, field="quantity",
+        )
+    if reason == "target":
+        return ClarificationContext(
+            reason=reason, fallback_question=f"Which {item.name} selection do you mean?",
+            subject=item.name, field="target",
+        )
+    option = item.options.get(field) if field is not None else None
+    if option is not None:
+        return ClarificationContext(
+            reason=reason,
+            fallback_question=f"Choose {field} for {item.name}: {', '.join(option.choices)}.",
+            subject=item.name, field=field, choices=tuple(option.choices),
+        )
+    return ClarificationContext(
+        reason=reason, fallback_question=questions[reason], subject=item.name, field=field,
+    )
 
 
 @dataclass(frozen=True)
@@ -54,9 +103,11 @@ def normalize(selection: Add, menu: Menu) -> OrderLine:
         value = selection.options.get(name, option.default)
         if value is None:
             if option.required:
-                raise ClarificationNeeded(
-                    "required_option", f"Choose {name} for {item.name}: {', '.join(option.choices)}.",
-                )
+                raise ClarificationNeeded(ClarificationContext(
+                    reason="required_option",
+                    fallback_question=f"Choose {name} for {item.name}: {', '.join(option.choices)}.",
+                    subject=item.name, field=name, choices=tuple(option.choices),
+                ))
             continue
         if value not in option.choices:
             raise InvalidSelection(f"Choose a supported {name} for {item.name}: {', '.join(option.choices)}.")
@@ -72,7 +123,10 @@ def normalize(selection: Add, menu: Menu) -> OrderLine:
 
 def resolve_target(target: Target, lines: list[OrderLine]) -> OrderLine:
     if target.line_id is None and target.item_id is None:
-        raise ClarificationNeeded("target", "Which item or order line do you want to change?")
+        raise ClarificationNeeded(ClarificationContext(
+            reason="target", fallback_question="Which item or order line do you want to change?",
+            subject="order selection", field="target",
+        ))
     item_id = ALIASES.get(target.item_id, target.item_id) if target.item_id is not None else None
     matches = [line for line in lines
                if (target.line_id is None or line.line_id == target.line_id)
@@ -82,11 +136,14 @@ def resolve_target(target: Target, lines: list[OrderLine]) -> OrderLine:
     if not matches:
         raise InvalidSelection("No order line matches that selection in your draft.")
     if len(matches) != 1:
-        choices = "; ".join(
+        choices = tuple(
             f"{index}: {line.quantity} × {line.name} ({', '.join(f'{key}: {value}' for key, value in line.options)})"
             for index, line in enumerate(matches, start=1)
         )
-        raise ClarificationNeeded("target", f"Which matching selection do you mean? {choices}.")
+        raise ClarificationNeeded(ClarificationContext(
+            reason="target", fallback_question=f"Which matching selection do you mean? {'; '.join(choices)}.",
+            subject=matches[0].name, field="target", choices=choices,
+        ))
     return matches[0]
 
 

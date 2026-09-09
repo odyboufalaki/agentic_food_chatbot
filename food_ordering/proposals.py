@@ -68,6 +68,8 @@ class RetrySubmission(StrictModel):
 class Clarify(StrictModel):
     type: Literal["clarify"]
     reason: Literal["required_option", "target", "quantity"]
+    item_id: str | None = None
+    field: str | None = None
 
 
 class CancelPending(StrictModel):

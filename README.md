@@ -129,6 +129,11 @@ enforces this distinction; only `submit` or `confirm` can authorize an invocatio
   reviewed revisions, any pending clarification, and at most six recent turns.
   A pending proposal remains separate from the draft until a direct answer
   completes it; Python then revalidates and applies the entire proposal atomically.
+  When clarification is needed, Python builds a structured context containing
+  the reason and any menu-derived subject, field, and choices. The Mistral adapter
+  makes one response-only call to turn that context into a concise question; it
+  receives no mutation or submission capability. A provider failure or empty
+  response falls back to Python's deterministic question.
   SDK retries are explicitly
   disabled; each turn permits an initial request and one transient retry or one
   schema repair, with a 20-second timeout per request. Authentication/configuration
@@ -168,6 +173,9 @@ an equivalent dictionary that Python validates.
 To test the real adapter without network access, pass a Mistral SDK client with a
 controlled HTTP transport to `MistralInterpreter(client=...)`. Injected clients
 are owned by the caller; default clients are closed after each interpretation.
+`FoodOrderAgent(clarification_renderer=...)` accepts a separate response renderer.
+Scripted or custom interpreters use the template renderer unless one is supplied;
+the default Mistral interpreter also renders clarification questions.
 
 Submission is injectable with `FoodOrderAgent(submitter=...)`. The synchronous
 `submit(payload)` boundary returns a `SubmissionResult` describing acceptance,

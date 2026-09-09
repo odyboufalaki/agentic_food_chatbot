@@ -2,6 +2,7 @@ import json
 
 from agent import FoodOrderAgent
 from food_ordering.interpretation import ModelFailure
+from food_ordering.order import ClarificationContext
 from food_ordering.submission import MCPSubmitter, SubmissionSettings
 from test_agent import ScriptedInterpreter, add
 from test_submission import RECEIPT, RestaurantTransport
@@ -15,6 +16,65 @@ class CapturingInterpreter(ScriptedInterpreter):
     def interpret(self, **context):
         self.contexts.append(context)
         return super().interpret(**context)
+
+
+class CapturingRenderer:
+    def __init__(self, response="Could you choose one?"):
+        self.response = response
+        self.contexts = []
+
+    def render(self, clarification):
+        self.contexts.append(clarification)
+        if isinstance(self.response, Exception):
+            raise self.response
+        return self.response
+
+
+def test_required_option_context_can_be_rendered_conversationally(tmp_path):
+    renderer = CapturingRenderer(
+        "Which milkshake flavor sounds good: vanilla, chocolate, strawberry, or Oreo?",
+    )
+    agent = FoodOrderAgent(
+        interpreter=ScriptedInterpreter({"operations": [add("milkshake")]}),
+        clarification_renderer=renderer,
+        log_path=tmp_path / "turns.jsonl",
+    )
+    response = agent.send("A milkshake")["message"]
+    assert response.startswith("Which milkshake flavor sounds good")
+    assert response.endswith("No changes have been applied.")
+    assert renderer.contexts == [ClarificationContext(
+        reason="required_option",
+        fallback_question="Choose flavor for Milkshake: vanilla, chocolate, strawberry, oreo.",
+        subject="Milkshake", field="flavor",
+        choices=("vanilla", "chocolate", "strawberry", "oreo"),
+    )]
+
+
+def test_clarification_renderer_failure_uses_python_fallback(tmp_path):
+    renderer = CapturingRenderer(ModelFailure("model_timeout"))
+    agent = FoodOrderAgent(
+        interpreter=ScriptedInterpreter({"operations": [{"type": "clarify", "reason": "quantity"}]}),
+        clarification_renderer=renderer,
+        log_path=tmp_path / "turns.jsonl",
+    )
+    assert agent.send("Some burgers")["message"] == (
+        "What exact quantity do you mean? No changes have been applied."
+    )
+
+
+def test_quantity_clarification_identifies_the_menu_item_for_the_renderer(tmp_path):
+    renderer = CapturingRenderer("How many servings of Classic Burger would you like?")
+    agent = FoodOrderAgent(
+        interpreter=ScriptedInterpreter({"operations": [{
+            "type": "clarify", "reason": "quantity", "item_id": "burger", "field": "quantity",
+        }]}),
+        clarification_renderer=renderer,
+        log_path=tmp_path / "turns.jsonl",
+    )
+    response = agent.send("I want burgers and a vanilla milkshake")["message"]
+    assert response.startswith("How many servings of Classic Burger")
+    assert renderer.contexts[0].subject == "Classic Burger"
+    assert renderer.contexts[0].field == "quantity"
 
 
 def test_missing_required_choice_holds_the_whole_request_until_answered(tmp_path):

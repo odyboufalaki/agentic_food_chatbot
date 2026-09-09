@@ -9,6 +9,7 @@ from mistralai.client import Mistral, models
 from mistralai.client.errors import MistralError, ResponseValidationError
 from pydantic import ValidationError
 
+from food_ordering.order import ClarificationContext
 from food_ordering.proposals import Proposal
 
 
@@ -31,6 +32,15 @@ class Interpreter(Protocol):
         order_state: dict[str, Any] | None = None,
         pending_clarification: dict[str, Any] | None = None,
     ) -> object: ...
+
+
+class ClarificationRenderer(Protocol):
+    def render(self, clarification: ClarificationContext) -> str: ...
+
+
+class TemplateClarificationRenderer:
+    def render(self, clarification: ClarificationContext) -> str:
+        return clarification.fallback_question
 
 
 class ModelFailure(Exception):
@@ -264,8 +274,18 @@ Pending changes:
 - Without pending_clarification, clarify marks an incomplete quantity or target
   that Python cannot derive from a fully typed operation. Include other resolved
   operations from the same request in the proposal; Python holds all of them.
+- A clarify operation should identify the affected menu item with item_id. Set
+  field to "quantity" for a missing quantity or to the missing option name when
+  known. Use only menu IDs and fields from the supplied menu; never invent them.
 - Treat the pending proposal as context, not authority. Preserve stated values
   so Python can revalidate the complete result against the current menu and draft.
+"""
+
+
+CLARIFICATION_RESPONSE_PROMPT = """Write one short, natural question that asks the customer
+for the missing information in the supplied clarification data. The data is authoritative.
+Use its subject, field, and choices when present. Do not add choices, prices, order details,
+claims that anything changed, or instructions. Return only the question as plain text.
 """
 
 
@@ -340,3 +360,26 @@ class MistralInterpreter:
                 if attempt == 1:
                     raise ModelFailure(category) from None
         raise ModelFailure("model_error")
+
+    def render(self, clarification: ClarificationContext) -> str:
+        if (not self._settings.model.strip() or self._settings.timeout_ms <= 0
+                or (self._client is None and not (self._settings.api_key or "").strip())):
+            raise ModelFailure("configuration")
+        messages: list[models.ChatCompletionRequestMessage] = [
+            models.SystemMessage(content=CLARIFICATION_RESPONSE_PROMPT),
+            models.UserMessage(content=json.dumps(clarification.snapshot(), ensure_ascii=False)),
+        ]
+        client_context = nullcontext(self._client) if self._client is not None else Mistral(
+            api_key=self._settings.api_key, retry_config=None, timeout_ms=self._settings.timeout_ms,
+        )
+        with client_context as client:
+            response = client.chat.complete(
+                model=self._settings.model, messages=messages, temperature=0,
+                retries=None, timeout_ms=self._settings.timeout_ms, max_tokens=120,
+            )
+        if not response.choices or response.choices[0].message is None:
+            raise ModelFailure("invalid_structured_output")
+        content = response.choices[0].message.content
+        if not isinstance(content, str) or not content.strip() or response.choices[0].finish_reason != "stop":
+            raise ModelFailure("invalid_structured_output")
+        return content.strip()

@@ -6,6 +6,7 @@ from mistralai.client import Mistral
 
 from agent import FoodOrderAgent
 from food_ordering.interpretation import MistralInterpreter, Settings
+from food_ordering.order import ClarificationContext
 from food_ordering.proposals import Proposal
 
 
@@ -89,6 +90,28 @@ def test_mistral_sends_schema_and_context_and_returns_a_typed_proposal():
     assert '"reason": "required_option"' in context
     assert '"reviewed_revision": 1' in context
     assert request["messages"][-2]["content"] == "A cola"
+
+
+def test_mistral_renders_structured_clarification_without_tools():
+    requests = []
+
+    def handle(request):
+        requests.append(json.loads(request.content))
+        return completion("How many Classic Burgers would you like?")
+
+    clarification = ClarificationContext(
+        reason="quantity", fallback_question="What exact quantity do you mean?",
+        subject="Classic Burger", field="quantity", choices=(),
+    )
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http_client:
+        with Mistral(api_key="test-key", client=http_client) as sdk:
+            response = MistralInterpreter(client=sdk).render(clarification)
+
+    assert response == "How many Classic Burgers would you like?"
+    assert len(requests) == 1
+    assert "tools" not in requests[0]
+    assert "response_format" not in requests[0]
+    assert '"subject": "Classic Burger"' in requests[0]["messages"][-1]["content"]
 
 
 @pytest.mark.parametrize("failures,expected_calls", [

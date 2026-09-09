@@ -9,9 +9,9 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
-from food_ordering.interpretation import Interpreter, MistralInterpreter, ModelFailure
+from food_ordering.interpretation import ClarificationRenderer, Interpreter, MistralInterpreter, ModelFailure, TemplateClarificationRenderer
 from food_ordering.menu import load_menu, menu_context
-from food_ordering.order import ClarificationNeeded, InvalidSelection, OrderLine, change_quantity, edit_line, normalize, render_draft, render_menu, resolve_target, submission_payload
+from food_ordering.order import ClarificationContext, ClarificationNeeded, InvalidSelection, OrderLine, build_clarification_context, change_quantity, edit_line, normalize, render_draft, render_menu, resolve_target, submission_payload
 from food_ordering.proposals import AbandonPending, Add, CancelPending, ChangeQuantity, Clarify, ClearDraft, Edit, MenuQuestion, NewOrder, Proposal, RemoveLine, RetrySubmission, Review, Submit, Summary, Unsupported
 from food_ordering.submission import MCPSubmitter, Submitter, render_receipt
 from food_ordering.turn_logging import TurnLogger
@@ -24,12 +24,14 @@ DRAFT_CHANGE_TYPES = (Add, Edit, ChangeQuantity, RemoveLine, ClearDraft, NewOrde
 class PendingChange:
     original_message: str
     proposal: Proposal
-    reason: str
-    question: str
+    clarification: ClarificationContext
 
     def snapshot(self) -> dict[str, Any]:
         return {"original_message": self.original_message, "proposal": self.proposal.model_dump(),
-                "reason": self.reason, "question": self.question}
+                "reason": self.clarification.reason,
+                "question": self.clarification.fallback_question,
+                "subject": self.clarification.subject, "field": self.clarification.field,
+                "choices": list(self.clarification.choices)}
 
 
 class TurnHandled(Exception):
@@ -40,8 +42,12 @@ class TurnHandled(Exception):
 
 class FoodOrderAgent:
     def __init__(self, *, interpreter: Interpreter | None = None, log_path: Path | None = None,
-                 submitter: Submitter | None = None) -> None:
+                 submitter: Submitter | None = None,
+                 clarification_renderer: ClarificationRenderer | None = None) -> None:
         self._interpreter = interpreter if interpreter is not None else MistralInterpreter()
+        self._clarification_renderer = (clarification_renderer if clarification_renderer is not None
+                                        else self._interpreter if isinstance(self._interpreter, MistralInterpreter)
+                                        else TemplateClarificationRenderer())
         self._menu = load_menu()
         self._lines: list[OrderLine] = []
         self._history: deque[dict[str, str]] = deque(maxlen=12)
@@ -117,17 +123,15 @@ class FoodOrderAgent:
                     pending_at_start is not None and not abandoned_pending
                     and all(isinstance(operation, Clarify) for operation in proposal.operations)
                 )
-                questions = {
-                    "required_option": "Which required option would you like?",
-                    "target": "Which selection do you mean?",
-                    "quantity": "What exact quantity do you mean?",
-                }
-                raise ClarificationNeeded(clarification.reason, questions[clarification.reason])
+                raise ClarificationNeeded(build_clarification_context(
+                    clarification.reason, self._menu,
+                    item_id=clarification.item_id, field=clarification.field,
+                ))
             if pending_at_start is not None and not abandoned_pending and any(
                 isinstance(operation, (Submit, Review, RetrySubmission)) for operation in proposal.operations
             ) and not any(isinstance(operation, DRAFT_CHANGE_TYPES) for operation in proposal.operations):
                 preserve_pending_proposal = True
-                raise ClarificationNeeded(pending_at_start.reason, pending_at_start.question)
+                raise ClarificationNeeded(pending_at_start.clarification)
             attempts_change = any(isinstance(operation, DRAFT_CHANGE_TYPES) for operation in proposal.operations)
             if attempts_change:
                 self._reviewed_revision = None
@@ -197,7 +201,9 @@ class FoodOrderAgent:
                     answers.append(render_draft(candidate))
             response: dict[str, Any] = {"message": "\n\n".join(answers)}
             if pending_at_start is not None and changed and not abandoned_pending and not clears_pending:
-                lifecycle_operations.append({"type": "clarification_resolved", "reason": pending_at_start.reason})
+                lifecycle_operations.append({
+                    "type": "clarification_resolved", "reason": pending_at_start.clarification.reason,
+                })
             operations = lifecycle_operations + validated_operations
             self._lines = candidate
             if changed:
@@ -281,15 +287,26 @@ class FoodOrderAgent:
                                else proposal)
             if stored_proposal is None:
                 raise RuntimeError("Clarification requested without a proposal") from error
-            self._pending_change = PendingChange(source_message, stored_proposal, error.reason, error.question)
-            operations = lifecycle_operations + [{"type": "clarification_requested", "reason": error.reason}]
-            response = {"message": error.question + " No changes have been applied."}
+            self._pending_change = PendingChange(source_message, stored_proposal, error.context)
+            operations = lifecycle_operations + [{
+                "type": "clarification_requested", "reason": error.context.reason,
+            }]
+            try:
+                question = self._clarification_renderer.render(error.context).strip()
+            except Exception:
+                question = error.context.fallback_question
+            if not question:
+                question = error.context.fallback_question
+            response = {"message": question + " No changes have been applied."}
         except InvalidSelection as error:
             failed_conversation_turn = True
             error_category = "invalid_selection"
             operations = lifecycle_operations
             if pending_at_start is not None and self._pending_change is not None:
-                response = {"message": f"{error} {self._pending_change.question} No changes have been applied."}
+                response = {"message": (
+                    f"{error} {self._pending_change.clarification.fallback_question} "
+                    "No changes have been applied."
+                )}
             else:
                 response = {"message": (render_draft(self._lines) + f"\n{error} The order was not submitted.")
                         if draft_changed else f"{error} Your draft is unchanged. Please restate the complete request."}
