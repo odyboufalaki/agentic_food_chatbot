@@ -113,6 +113,20 @@ def render_draft(lines: list[OrderLine]) -> str:
     return "Draft order:\n" + "\n".join(descriptions) + f"\nTotal: {money(sum(line.total_cents for line in lines))}"
 
 
+def submission_payload(lines: list[OrderLine], menu: Menu) -> dict[str, Any]:
+    if not lines:
+        raise InvalidSelection("An empty order cannot be submitted. Add an item first.")
+    validated = [normalize(Add(
+        type="add", item_id=line.item_id, quantity=line.quantity,
+        options=dict(line.options), extras=list(line.extras),
+    ), menu) for line in lines]
+    total = sum(line.total_cents for line in validated)
+    if total > 5000:
+        raise InvalidSelection(f"The order total is {money(total)}. Reduce it to $50.00 or less before submission.")
+    return {"items": [{"item_id": line.item_id, "quantity": line.quantity,
+                       "options": dict(line.options), "extras": list(line.extras)} for line in validated]}
+
+
 def render_menu(menu: Menu, item_ids: list[str]) -> str:
     requested = {ALIASES.get(item_id, item_id) for item_id in item_ids}
     if not requested <= {item.id for item in menu.menu}:

@@ -2,7 +2,8 @@
 
 Ask about the assignment menu and build, edit, or clear an in-memory, priced draft
 through natural language. Python validates and prices the order; Mistral
-interprets requests into typed proposals (tickets 01–02).
+interprets requests into typed proposals. Review a valid order, explicitly confirm
+it, and receive a restaurant receipt through MCP (tickets 01–03).
 
 ## Setup
 
@@ -12,6 +13,7 @@ Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and then r
 uv python install 3.13
 uv sync --locked
 export MISTRAL_API_KEY='your-studio-api-key'
+export APPLICANT_EMAIL='your-cv-email@example.com'
 # Optional; the default is mistral-small-latest:
 export MISTRAL_MODEL='mistral-small-latest'
 # Optional; the default is logs/turns.jsonl:
@@ -40,10 +42,14 @@ print(response["message"])  # Normalized draft, total $13.00
 print(agent.send("Remove the bacon from my burger")["message"])  # $11.50
 print(agent.send("What milkshake flavors do you have?")["message"])
 print(agent.send("Show my draft")["message"])
+print(agent.send("Submit")["message"])  # Review and confirmation question; no restaurant call
+print(agent.send("Yes")["message"])  # One restaurant call and its receipt
 ```
 
 Every synchronous `send(str)` returns a dictionary containing `message`.
-There are no restaurant calls in this slice, so responses omit `tool_calls`.
+An actual restaurant invocation also returns `tool_calls`, containing its `name`,
+`arguments`, and dictionary `result`. Other turns omit that field, including
+repeated approval after acceptance.
 The CLI uses this same method; `quit`, `exit`, EOF, and Ctrl-C end the session.
 
 ## Demo
@@ -81,6 +87,20 @@ For the assignment's multiple-item price, use a fresh agent and ask for a medium
 margherita with olives, large fries with parmesan, and a **large** cola: **$22.25**.
 You can also request a default cola first and then ask to make it large.
 
+To finish an order, say "That's it" or "Submit". The agent presents the full
+normalized order and asks for confirmation. Reply "Yes" or "Submit" to send it.
+A second "Yes" repeats the receipt without another invocation. After acceptance,
+say "Start a new order with fries" to begin another draft explicitly.
+
+Ordinary add/edit summaries and "Show my draft" are informational. Checkout
+starts with a submit request. If approval includes an edit, the updated order
+is reviewed again before it can be submitted. An invalid edit or failed model
+interpretation also clears the previous approval eligibility. Informational menu
+questions can retain an unchanged review.
+A request such as "review for checkout" always displays a review and never counts
+as approval, even if a prior review was eligible. The separate `review` operation
+enforces this distinction; only `submit` or `confirm` can authorize an invocation.
+
 ## Design
 
 - `agent.py`: one conversation, active draft, atomic turn coordination and public API.
@@ -105,7 +125,8 @@ You can also request a default cola first and then ask to make it large.
   removal. Removing more servings than exist is rejected.
 - `interpretation.py`: direct synchronous Mistral SDK integration using
   [custom structured output](https://docs.mistral.ai/studio/conversations/structured-output/custom).
-  It receives menu data, a fresh draft snapshot, and at most six recent turns.
+  It receives menu data, a fresh draft snapshot, submission status, current and
+  reviewed revisions, and at most six recent turns.
   There is no pending clarification in this slice. SDK retries are explicitly
   disabled; each turn permits an initial request and one transient retry or one
   schema repair, with a 20-second timeout per request. Authentication/configuration
@@ -113,6 +134,25 @@ You can also request a default cola first and then ask to make it large.
   [SDK source](https://github.com/mistralai/client-python) and installed 2.9.4 code
   were checked for the retry and structured-output interfaces.
 - `turn_logging.py`: append-only local JSONL, isolated from the customer outcome.
+- `submission.py`: one synchronous adapter around the official
+  [MCP Python SDK v1](https://github.com/modelcontextprotocol/python-sdk/tree/v1.x),
+  locked to 1.30.0. Each authorized attempt creates an HTTP client and MCP session,
+  initializes, inspects `submit_order`, validates the payload against its advertised
+  input schema, invokes once, and closes. `APPLICANT_EMAIL` supplies the required
+  `X-Applicant-Email` header on every request to the assignment endpoint.
+  A 20-second overall deadline and HTTP/session timeouts bound the attempt.
+  Schema references resolve locally; they cannot fetch another URL.
+  JSON and SSE are handled by the SDK's Streamable HTTP transport. The public
+  `ClientSession.send_request` API retains raw tool results so text-only receipts
+  are available even when a tool advertises an output schema. Structured content
+  takes precedence, with JSON text as fallback. No tool invocation is retried.
+
+Before submission, Python revalidates the menu selections and total, rejects an
+empty order or a total above $50, and freezes the outgoing payload. Exactly $50
+is permitted. Payloads contain normalized item IDs, positive quantities, options,
+and unique extras. Internal line IDs and empty `special_instructions` are omitted.
+Over-limit drafts remain editable, including a valid edit accompanied by a blocked
+submit request.
 
 The explicit aliases are `burger` → `classic_burger`, `cola` → `soda`, and
 `pizza` → `margherita`. The interpreter also maps menu names and natural-language
@@ -120,18 +160,31 @@ option wording to menu IDs. Model-generated prices, prose, and submission claims
 are never used as authoritative output.
 
 External interpretation is injectable with `FoodOrderAgent(interpreter=...)`.
-Its `interpret` method accepts keyword arguments `message`, `menu`, `draft`, and
-`history`, returning a `Proposal` or an equivalent dictionary that Python validates.
+Its `interpret` method accepts keyword arguments `message`, `menu`, `draft`,
+`history`, and `order_state`, returning a `Proposal` or an equivalent dictionary
+that Python validates.
 To test the real adapter without network access, pass a Mistral SDK client with a
 controlled HTTP transport to `MistralInterpreter(client=...)`. Injected clients
 are owned by the caller; default clients are closed after each interpretation.
 
+Submission is injectable with `FoodOrderAgent(submitter=...)`. The synchronous
+`submit(payload)` boundary returns a `SubmissionResult` describing acceptance,
+rejection, uncertainty, or failure before invocation. `MCPSubmitter(transport=...)`
+accepts a controlled HTTPX async transport for tests; the adapter closes it.
+`SubmissionSettings` can configure the applicant identity and timeout in code.
+
+Async hosts must run `send` in a worker thread (for example,
+`await asyncio.to_thread(agent.send, message)`) and serialize calls per agent.
+The adapter uses `asyncio.run` for each attempt, with no persistent event loop or
+connection service. It refuses direct execution inside an already running loop.
+
 ## Logging and privacy
 
 Every send attempt writes session/turn IDs, timestamp, input, response, validated
-operations, before/after totals in cents, draft revision/status transition, elapsed
-milliseconds, and an error category. `tool_calls` is empty until submission is
-implemented. Failed validation records no applied operations.
+operations, before/after totals in cents, current and reviewed revisions/status
+transition, elapsed milliseconds, and an error category. `tool_calls` reports only
+actual attempts and their arguments/results. Failed draft validation records no
+applied operations; a blocked checkout can retain valid edits made in that turn.
 
 Logs retain customer conversation text locally. They contain no SDK response
 objects, HTTP headers, exception bodies, or hidden reasoning. The configured
@@ -148,28 +201,39 @@ uv run --locked mypy
 # Focused behavioral or transport tests:
 uv run --locked pytest tests/test_agent.py
 uv run --locked pytest tests/test_mistral.py
+uv run --locked pytest tests/test_submission.py
 ```
 
 Tests use scripted interpretation or the real Mistral SDK with a controlled HTTP
-transport. The default suite blocks network connections and removes live provider
+transport, plus the real MCP client against controlled JSON/SSE HTTP responses.
+The default suite blocks network connections and removes live provider
 configuration. It exercises pricing, atomic rejection, model request counts,
 sanitized failure logging, and both required entry points without live credentials.
 Scripted results do not establish live natural-language accuracy; no successful
-live-model evaluation is included in this ticket.
+live-model evaluation or restaurant call is included in this ticket. Since the
+supplied menu prices are multiples of 25 cents, the exact $50.01 rejection is
+tested at the public deterministic submission validator using a boundary menu.
 
 ## Current limitations
 
 This slice adds, edits, and removes selections, clears unsubmitted drafts,
-answers menu questions, and displays drafts. Splitting some servings into another
+answers menu questions, reviews and submits confirmed orders. Splitting some servings into another
 configuration, changing multiple matching lines as a group, grouping identical
 displayed lines, product replacement, preparation instructions, pending clarification
-continuation, confirmation, and MCP submission are later tickets.
+continuation, and detailed rejection/retry recovery are later tickets.
 If a required choice is missing, such as milkshake flavor, the whole message is
 rejected with choices and a request to restate it completely. An over-$50 draft
-stays open to additions and edits; later tickets enforce the limit at submission.
-No food is ordered from a restaurant in this version.
+stays open to additions and edits, but cannot be submitted until within the limit.
+
+Explicit rejection preserves the selections and server explanation. This slice
+does not offer unchanged retries; ticket 04 adds customer-requested retry handling.
+A lost or unrecognized result may mean the order was accepted, so uncertainty
+blocks resubmission and new-order reset within the session. Receipt details already
+received survive cleanup or logging failures. Detailed receipt discrepancy handling
+also belongs to ticket 04.
 
 Instances are in-memory and calls per instance must be serialized. Restarting
-loses the draft. Menu data cannot establish ingredient or allergy guarantees.
+loses the draft and duplicate-submission protection; there is no cross-restart
+deduplication or server reconciliation. Menu data cannot establish ingredient or allergy guarantees.
 Model credentials, account access, quota availability, and live interpretation
 quality must be checked separately before a live demonstration.

@@ -7,7 +7,10 @@ class ScriptedInterpreter:
         self.proposals = iter(proposals)
 
     def interpret(self, **context):
-        return next(self.proposals)
+        proposal = next(self.proposals)
+        if isinstance(proposal, Exception):
+            raise proposal
+        return proposal
 
 
 def add(item_id, quantity=1, options=None, extras=None):
@@ -216,7 +219,7 @@ def test_large_burger_with_cheese_and_bacon_costs_thirteen_dollars(tmp_path):
     {**add("fries"), "options": []},
     {**add("fries"), "extras": "parmesan"},
     {**add("fries"), "total": 0},
-    {"type": "submit"},
+    {"type": "unknown_action"},
 ])
 def test_invalid_message_leaves_all_existing_selections_unchanged(tmp_path, invalid):
     agent = FoodOrderAgent(interpreter=ScriptedInterpreter(

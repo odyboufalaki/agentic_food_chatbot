@@ -7,6 +7,7 @@ import pytest
 def controlled_environment(monkeypatch, tmp_path):
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
     monkeypatch.delenv("MISTRAL_MODEL", raising=False)
+    monkeypatch.delenv("APPLICANT_EMAIL", raising=False)
     monkeypatch.setenv("FOOD_ORDER_LOG_PATH", str(tmp_path / "default-turns.jsonl"))
 
     def forbid_network(*args, **kwargs):

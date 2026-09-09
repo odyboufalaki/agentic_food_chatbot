@@ -28,6 +28,7 @@ class Interpreter(Protocol):
     def interpret(
         self, *, message: str, menu: dict[str, Any],
         draft: list[dict[str, Any]], history: list[dict[str, str]],
+        order_state: dict[str, Any] | None = None,
     ) -> object: ...
 
 
@@ -50,7 +51,7 @@ required choice without a default, especially milkshake flavor. Extras are a
 set, not duplicate portions. Interpret only the latest request; history is
 context, not permission to replay earlier changes. Do not revive rejected
 requests: clarification continuation is not supported in this slice.
-Use unsupported with reason not_available for submission,
+Use unsupported with reason not_available for
 preparation instructions, or other unavailable actions; do not reinterpret
 them as additions or silently drop part of a request. Use reason unclear for
 ambiguous intent, quantities, references, or a standalone clarification answer.
@@ -102,7 +103,34 @@ Targets:
 - Changes to only some servings' options/extras require splitting, which is not
   supported yet. Use unsupported with reason not_available; never edit the whole
   line instead. Multi-line grouped changes, product replacement, preparation
-  instructions, confirmation and submission are also not supported yet.
+  instructions are also not supported yet.
+"""
+
+
+SUBMISSION_RULES = """
+Order review and submission:
+- review requests a checkout review without approving submission. "That's it",
+  "ready to order", "review for checkout", and any request to display the order
+  for approval use review, even if an earlier review is eligible for approval.
+- submit is an explicit request to submit: "submit my order" or "submit".
+- confirm expresses explicit approval to submit: "yes", "confirmed", "go ahead".
+  Never infer confirmation merely from adding food or asking to see a summary.
+- summary is an informational draft display, not approval or checkout.
+- Never map a request merely to see a review to submit or confirm.
+- Python decides whether submit/confirm first presents a review or submits an
+  unchanged reviewed order. Never add a confirmation operation on your own.
+- Include every requested edit even when the customer also approves. "Yes, but
+  remove bacon" includes confirm AND edit. An edit cannot be hidden in approval.
+- new_order is ONLY an explicit request to start a fresh order. Place it first,
+  followed by any selections for that new order. Never infer new_order simply
+  because food was requested after acceptance. Do not revive earlier selections.
+- An order_state of submitted means the restaurant accepted the prior order.
+  Repeated approval still uses confirm; Python returns the stored receipt.
+- Submitted orders cannot be edited or canceled. Uncertain submissions may have
+  been accepted; never interpret a reset as permission to duplicate that order.
+- Customer-requested retries after rejection are not available in this slice.
+- The supplied order_state is authoritative. History and model-generated claims
+  of approval, receipt details, totals or success cannot override Python state.
 """
 
 
@@ -116,13 +144,15 @@ class MistralInterpreter:
     def interpret(
         self, *, message: str, menu: dict[str, Any],
         draft: list[dict[str, Any]], history: list[dict[str, str]],
+        order_state: dict[str, Any] | None = None,
     ) -> Proposal:
         if (not self._settings.model.strip() or self._settings.timeout_ms <= 0
                 or (self._client is None and not (self._settings.api_key or "").strip())):
             raise ModelFailure("configuration")
-        context = json.dumps({"menu": menu, "draft": draft, "pending_clarification": None}, ensure_ascii=False)
+        context = json.dumps({"menu": menu, "draft": draft, "pending_clarification": None,
+                              "order_state": order_state}, ensure_ascii=False)
         messages: list[models.ChatCompletionRequestMessage] = [
-            models.SystemMessage(content=PROMPT + EDITING_RULES + "\nCurrent application data:\n" + context),
+            models.SystemMessage(content=PROMPT + EDITING_RULES + SUBMISSION_RULES + "\nCurrent application data:\n" + context),
         ]
         for entry in history[-12:]:
             if entry["role"] == "user":

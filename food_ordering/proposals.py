@@ -49,6 +49,18 @@ class ClearDraft(StrictModel):
     type: Literal["clear_draft"]
 
 
+class Submit(StrictModel):
+    type: Literal["submit", "confirm"]
+
+
+class Review(StrictModel):
+    type: Literal["review"]
+
+
+class NewOrder(StrictModel):
+    type: Literal["new_order"]
+
+
 class MenuQuestion(StrictModel):
     type: Literal["menu"]
     item_ids: list[str] = Field(default_factory=list)
@@ -60,7 +72,7 @@ class Unsupported(StrictModel):
 
 
 Operation = Annotated[
-    Add | Edit | RemoveLine | ChangeQuantity | ClearDraft | Summary | MenuQuestion | Unsupported,
+    Add | Edit | RemoveLine | ChangeQuantity | ClearDraft | Submit | Review | NewOrder | Summary | MenuQuestion | Unsupported,
     Field(discriminator="type"),
 ]
 

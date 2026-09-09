@@ -3,10 +3,23 @@ name = "food-ordering-chatbot"
 version = "0.1.0"
 description = "A conversational, deterministically priced food-order draft"
 requires-python = ">=3.13"
-dependencies = ["mistralai>=2,<3", "pydantic>=2,<3", "pyyaml>=6,<7", "httpx>=0.28,<1"]
+dependencies = [
+    "mistralai>=2,<3",
+    "pydantic>=2,<3",
+    "pyyaml>=6,<7",
+    "httpx>=0.28,<1",
+    "mcp>=1.30,<2",
+    "jsonschema>=4,<5",
+    "referencing>=0.37,<1",
+]
 
 [dependency-groups]
-dev = ["pytest>=8", "mypy>=1", "types-PyYAML>=6"]
+dev = [
+    "pytest>=8",
+    "mypy>=1",
+    "types-PyYAML>=6",
+    "types-jsonschema>=4.26.0.20260518",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

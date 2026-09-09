@@ -66,6 +66,7 @@ def test_mistral_sends_schema_and_context_and_returns_a_typed_proposal():
                 message="What is in my draft?", menu={"items": []},
                 draft=[{"item_id": "soda", "quantity": 1}],
                 history=[{"role": "user", "content": "A cola"}],
+                order_state={"status": "draft", "revision": 1, "reviewed_revision": 1},
             )
     assert isinstance(proposal, Proposal)
     assert proposal.operations[0].type == "summary"
@@ -78,6 +79,7 @@ def test_mistral_sends_schema_and_context_and_returns_a_typed_proposal():
     context = request["messages"][0]["content"]
     assert '"item_id": "soda"' in context
     assert '"pending_clarification": null' in context
+    assert '"reviewed_revision": 1' in context
     assert request["messages"][-2]["content"] == "A cola"
 
 
