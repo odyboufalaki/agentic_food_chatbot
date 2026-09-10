@@ -37,9 +37,15 @@ def build_clarification_context(
         "required_option": "Which required option would you like?",
         "target": "Which selection do you mean?",
         "quantity": "What exact quantity do you mean?",
+        "replacement_notes": "Should I keep or discard the existing preparation instructions?",
     }
     resolved_id = ALIASES.get(item_id, item_id) if item_id is not None else None
     item = next((candidate for candidate in menu.menu if candidate.id == resolved_id), None)
+    if reason == "replacement_notes":
+        return ClarificationContext(
+            reason=reason, fallback_question=questions[reason],
+            subject=item.name if item else None, field="replacement_notes", choices=("keep", "discard"),
+        )
     if item is None:
         return ClarificationContext(reason=reason, fallback_question=questions[reason], field=field or reason)
     if reason == "quantity":
@@ -117,10 +123,11 @@ def normalize(selection: Add, menu: Menu, *, line_id: str) -> OrderLine:
     if not set(extras) <= extra_prices.keys():
         raise InvalidSelection(f"Unsupported extra for {item.name}. Please choose a listed extra.")
     price += sum(extra_prices[extra] for extra in extras)
-    return OrderLine(item.id, item.name, selection.quantity, tuple(options.items()), extras, price, line_id)
+    return OrderLine(item.id, item.name, selection.quantity, tuple(options.items()), extras, price,
+                     line_id, selection.instructions.strip())
 
 
-def resolve_target(target: Target, lines: list[OrderLine]) -> OrderLine:
+def matching_lines(target: Target, lines: list[OrderLine]) -> list[OrderLine]:
     if target.line_id is None and target.item_id is None:
         raise ClarificationNeeded(ClarificationContext(
             reason="target", fallback_question="Which item or order line do you want to change?",
@@ -131,14 +138,19 @@ def resolve_target(target: Target, lines: list[OrderLine]) -> OrderLine:
                if (target.line_id is None or line.line_id == target.line_id)
                and (item_id is None or line.item_id == item_id)
                and target.options.items() <= dict(line.options).items()
-               and set(target.extras) <= set(line.extras)]
+               and set(target.extras) <= set(line.extras)
+               and (target.instructions is None or line.instructions == target.instructions)]
     if not matches:
         raise InvalidSelection("No order line matches that selection in your draft.")
+    return matches
+
+
+def resolve_target(target: Target, lines: list[OrderLine]) -> OrderLine:
+    matches = matching_lines(target, lines)
     if len(matches) != 1:
-        choices = tuple(
-            f"{index}: {line.quantity} × {line.name} ({', '.join(f'{key}: {value}' for key, value in line.options)})"
-            for index, line in enumerate(matches, start=1)
-        )
+        choices = tuple(f"{index}: {describe_line(line)}"
+                        + (f"; instructions: {line.instructions}" if line.instructions else "")
+                        for index, line in enumerate(matches, start=1))
         raise ClarificationNeeded(ClarificationContext(
             reason="target", fallback_question=f"Which matching selection do you mean? {'; '.join(choices)}.",
             subject=matches[0].name, field="target", choices=choices,
@@ -147,18 +159,80 @@ def resolve_target(target: Target, lines: list[OrderLine]) -> OrderLine:
 
 
 def edit_line(operation: Edit, line: OrderLine, menu: Menu) -> OrderLine:
-    if not operation.options and not operation.add_extras and not operation.remove_extras:
+    if (not operation.options and not operation.add_extras and not operation.remove_extras
+            and operation.instructions is None and operation.replacement_item_id is None):
         raise InvalidSelection("Specify the options or extras you want to change.")
     if set(operation.add_extras) & set(operation.remove_extras):
         raise InvalidSelection("Specify whether to add or remove each extra.")
     if not set(operation.remove_extras) <= set(line.extras):
         raise InvalidSelection("That extra is not selected on this order line.")
+    replacing = (operation.replacement_item_id is not None
+                 and ALIASES.get(operation.replacement_item_id, operation.replacement_item_id) != line.item_id)
+    if replacing and line.instructions and operation.replacement_notes is None:
+        raise ClarificationNeeded(ClarificationContext(
+            reason="replacement_notes",
+            fallback_question=f"Keep or discard the instructions '{line.instructions}' when replacing {line.name}?",
+            subject=line.name, field="replacement_notes", choices=("keep", "discard"),
+        ))
     updated = normalize(Add(
-        type="add", item_id=line.item_id, quantity=line.quantity,
-        options={**dict(line.options), **operation.options},
-        extras=sorted((set(line.extras) - set(operation.remove_extras)) | set(operation.add_extras)),
+        type="add", item_id=operation.replacement_item_id or line.item_id, quantity=line.quantity,
+        options=operation.options if replacing else {**dict(line.options), **operation.options},
+        extras=(operation.add_extras if replacing else
+                sorted((set(line.extras) - set(operation.remove_extras)) | set(operation.add_extras))),
     ), menu, line_id=line.line_id)
-    return replace(updated, instructions=line.instructions)
+    previous_notes = "" if replacing and operation.replacement_notes == "discard" else line.instructions
+    return replace(updated, instructions=(previous_notes if operation.instructions is None
+                                          else operation.instructions.strip()))
+
+
+def edit_servings(
+    operation: Edit, lines: list[OrderLine], menu: Menu, next_line_number: int,
+) -> tuple[list[OrderLine], int, list[dict[str, Any]]]:
+    matches = matching_lines(operation.target, lines)
+    if operation.quantity is None:
+        matches = [resolve_target(operation.target, lines)]
+    available = sum(line.quantity for line in matches)
+    quantity = available if operation.quantity in (None, "all") else operation.quantity
+    if not isinstance(quantity, int) or quantity <= 0 or quantity > available:
+        raise InvalidSelection(f"Choose a positive quantity up to {available} matching servings.")
+    candidate = list(lines)
+    changes = []
+    for line in matches:
+        if quantity == 0:
+            break
+        taken = min(quantity, line.quantity)
+        updated = edit_line(operation, replace(line, quantity=taken), menu)
+        index = candidate.index(line)
+        if taken < line.quantity and configuration(updated) != configuration(line):
+            updated = replace(updated, line_id=f"L{next_line_number}")
+            next_line_number += 1
+            portions = [replace(line, quantity=line.quantity - taken), updated]
+            candidate[index:index + 1] = portions
+            changes.append({"type": "split", "source_line_id": line.line_id,
+                            "lines": [portion.snapshot() for portion in portions]})
+        else:
+            updated = replace(updated, quantity=line.quantity)
+            candidate[index] = updated
+        changes.append({"type": "edit", **updated.snapshot()})
+        quantity -= taken
+    return candidate, next_line_number, changes
+
+
+def configuration(line: OrderLine) -> tuple[Any, ...]:
+    return line.item_id, line.options, line.extras, line.instructions
+
+
+def display_groups(lines: list[OrderLine]) -> list[list[OrderLine]]:
+    groups: dict[tuple[Any, ...], list[OrderLine]] = {}
+    for line in lines:
+        groups.setdefault(configuration(line), []).append(line)
+    return list(groups.values())
+
+
+def describe_line(line: OrderLine) -> str:
+    choices = ", ".join(f"{key}: {value}" for key, value in line.options)
+    extras = f"; extras: {', '.join(line.extras)}" if line.extras else ""
+    return f"{line.quantity} × {line.name} ({choices}{extras})"
 
 
 def change_quantity(operation: ChangeQuantity, line: OrderLine) -> OrderLine | None:
@@ -173,16 +247,18 @@ def change_quantity(operation: ChangeQuantity, line: OrderLine) -> OrderLine | N
     return replace(line, quantity=quantity) if quantity else None
 
 
-def render_draft(lines: list[OrderLine]) -> str:
+def render_draft(lines: list[OrderLine], instructions: str = "") -> str:
     descriptions = []
-    for line in lines:
-        choices = ", ".join(f"{key}: {value}" for key, value in line.options)
-        extras = f"; extras: {', '.join(line.extras)}" if line.extras else ""
-        descriptions.append(f"{line.quantity} × {line.name} ({choices}{extras}) — {money(line.total_cents)}")
+    for group in display_groups(lines):
+        line = replace(group[0], quantity=sum(part.quantity for part in group))
+        notes = f"; instructions: {line.instructions}" if line.instructions else ""
+        descriptions.append(f"{describe_line(line)}{notes} — {money(line.total_cents)}")
+    if instructions:
+        descriptions.append(f"General instructions: {instructions}")
     return "Draft order:\n" + "\n".join(descriptions) + f"\nTotal: {money(sum(line.total_cents for line in lines))}"
 
 
-def submission_payload(lines: list[OrderLine], menu: Menu) -> dict[str, Any]:
+def submission_payload(lines: list[OrderLine], menu: Menu, instructions: str = "") -> dict[str, Any]:
     if not lines:
         raise InvalidSelection("An empty order cannot be submitted. Add an item first.")
     validated = [normalize(Add(
@@ -192,8 +268,15 @@ def submission_payload(lines: list[OrderLine], menu: Menu) -> dict[str, Any]:
     total = sum(line.total_cents for line in validated)
     if total > 5000:
         raise InvalidSelection(f"The order total is {money(total)}. Reduce it to $50.00 or less before submission.")
-    return {"items": [{"item_id": line.item_id, "quantity": line.quantity,
+    payload: dict[str, Any] = {"items": [{"item_id": line.item_id, "quantity": line.quantity,
                        "options": dict(line.options), "extras": list(line.extras)} for line in validated]}
+    notes = [f"Item {index}: {describe_line(line)}: {line.instructions}"
+             for index, line in enumerate(lines, 1) if line.instructions]
+    if instructions:
+        notes.append(f"General: {instructions}")
+    if notes:
+        payload["special_instructions"] = "\n".join(notes)
+    return payload
 
 
 def render_menu(menu: Menu, item_ids: list[str]) -> str:

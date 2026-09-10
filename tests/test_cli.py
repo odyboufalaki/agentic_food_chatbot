@@ -8,6 +8,8 @@ from pathlib import Path
 from agent import FoodOrderAgent
 from main import main
 from test_agent import ScriptedInterpreter, add
+from test_customization import edit
+from test_submission import RestaurantTransport, restaurant_agent
 
 
 def test_interactive_entry_point_uses_send_and_logs_the_turn(tmp_path):
@@ -85,3 +87,24 @@ def test_cli_edits_and_removals_match_logged_summaries_and_prices(tmp_path):
     assert records[5]["operations"][0]["after_quantity"] == 4
     assert records[6]["operations"][0]["after_quantity"] == 5
     assert records[10]["operations"][0]["line_ids"] == [records[9]["operations"][0]["line_id"]]
+
+
+def test_cli_customization_demo_reviews_and_submits_the_logged_order(tmp_path):
+    transport = RestaurantTransport()
+    agent = restaurant_agent(tmp_path, transport,
+        {"operations": [add("burger", quantity=2)]},
+        {"operations": [edit(quantity=1, options={"patty": "chicken"}, instructions="no onions")]},
+        {"operations": [{"type": "review"}]}, {"operations": [{"type": "confirm"}]},
+    )
+    output = StringIO()
+    main(agent=agent, input_stream=StringIO(
+        "Two burgers\nMake one chicken with no onions\nReview\nYes\nquit\n"
+    ), output_stream=output)
+    text = output.getvalue()
+    assert "2 × Classic Burger" in text and "patty: chicken" in text and "no onions" in text
+    assert "Total: $17.00" in text and "ORD-12345" in text
+    records = [json.loads(line) for line in (tmp_path / "turns.jsonl").read_text().splitlines()]
+    assert all(record["response"]["message"] in text for record in records)
+    assert all(record["tool_calls"] == [] for record in records[:-1])
+    assert len(transport.calls) == 1
+    assert records[-1]["tool_calls"][0]["arguments"] == transport.calls[0]["arguments"]

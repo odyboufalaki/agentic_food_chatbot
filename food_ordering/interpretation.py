@@ -132,8 +132,10 @@ Conversation handling:
   pending rules below rather than treating it as a standalone request.
 
 Unsupported requests:
-- Use reason "not_available" for preparation
-  instructions, or other unavailable actions.
+- Use reason "not_available" for unavailable actions.
+- Preparation instructions are supported as plain text on add/edit.instructions
+  or set_instructions for general order notes. Never use notes for purchasable
+  additions: use extras even for unlisted additions so Python validates them.
 - Use reason "unclear" for intent that cannot be mapped to a more specific
   clarification operation.
 - Use reason "dietary_guarantee" for ingredient or allergy assurances that the
@@ -156,8 +158,13 @@ EDITING_RULES = """
 Draft changes:
 - Include every requested operation in message order in one proposal. Python
   validates the whole change before committing it; never drop an invalid part.
-- edit changes supported options and/or add_extras/remove_extras on one whole
-  existing line. Include only requested changes; preserve other selections.
+- edit changes supported options, add_extras/remove_extras, and/or instructions.
+  Include only requested changes; preserve other selections.
+- edit.quantity is the explicit number of matching servings to change, or "all"
+  only when the customer explicitly requests all matching servings. Python uses
+  earliest-line order and splits quantities as needed. Omit quantity for an
+  identified whole line. For vague quantities such as "some", use clarify with
+  reason quantity. Never turn a singular ambiguous reference into quantity 1.
 - set_quantity means the requested final number of servings on that line.
   "Make that two burgers" -> set_quantity with quantity 2.
 - increase_quantity adds the requested number to that line's existing quantity.
@@ -176,8 +183,16 @@ Targets:
 - target describes the CURRENT selection, while edit.options describes the NEW
   choices. Use item_id plus only the options/extras the customer used to identify
   it. Target extras must be present; omitted extras do not constrain matching.
-- A target must identify exactly one existing line. Never pick the first of
+- Unless the customer explicitly specifies a number of matching servings or all,
+  a target must identify exactly one existing line. Never pick the first of
   several matching lines or add details to make an ambiguous reference unique.
+- Never use conversational recency, history, or prior focus to narrow a target.
+  If strawberry and chocolate milkshakes exist, "make the milkshake large" must
+  keep target {"item_id":"milkshake"} without quantity, even if chocolate was
+  just discussed. Python must ask which milkshake.
+- target.instructions can distinguish lines by their existing preparation notes.
+  order_state.display_groups maps each displayed selection to its stored lines.
+  Display grouping never authorizes choosing one member of a group implicitly.
 - Use a current line_id only if the customer clearly identifies that line, such
   as "the second burger". Line IDs are short, session-local opaque identifiers.
   Copy the exact ID from the current draft; never derive, alter, or invent one.
@@ -193,10 +208,20 @@ Targets:
 - "Make the large burger regular" -> edit, target item_id classic_burger and
   options {"size":"large"}, with edit.options {"size":"regular"}.
 - Adding an already selected extra is allowed and does not add another charge.
-- Changes to only some servings' options/extras require splitting, which is not
-  supported yet. Use unsupported with reason not_available; never edit the whole
-  line instead. Multi-line grouped changes, product replacement, preparation
-  instructions are also not supported yet.
+- "Make one of the burgers chicken with no onions" -> edit with broad burger
+  target, quantity 1, options {"patty":"chicken"}, instructions "no onions".
+- instructions is the complete resulting plain text for the affected servings.
+  Preserve existing notes when appending another request; use an empty string
+  only to explicitly clear notes. Omitted/null edit.instructions preserves notes.
+- set_instructions replaces the general draft instructions; preserve existing
+  general requests when appending. General notes belong in order_state, not food.
+- For a different menu product, use edit.replacement_item_id and the requested
+  new product options and extras. Python applies the new product's defaults.
+  A patty change within Classic Burger is an option edit, not product replacement.
+- If replacing food with notes, omit replacement_notes until the customer says
+  to keep or discard them. Python asks for that choice. On the answer, reconstruct
+  the same edit with replacement_notes "keep" or "discard". Never infer ingredient
+  compatibility. Instructions cannot establish dietary or allergy guarantees.
 """
 
 
@@ -248,6 +273,17 @@ Pending changes:
   original request with the answer. Repeat every operation from the intended
   change, with the missing value or precise target filled in. Never return only
   the newly supplied word or choice.
+- Preserve every established quantity, target, option, extra, and instruction.
+  Resolving a missing option must never change the number of servings. Multiple
+  option values partition the established quantity: after "I want milkshakes",
+  "2", then "vanilla and strawberry", return two add operations of quantity 1,
+  one vanilla and one strawberry, NEVER two vanilla plus another strawberry.
+  If the allocation is ambiguous, clarify how to divide the existing quantity.
+- corrected_fields defaults to []. Only if the latest answer EXPLICITLY revises
+  an already resolved field, list that exact pending operation index and field,
+  e.g. ["0.quantity"] for "Actually three, vanilla", or ["0.options.size"] for
+  an explicit size correction. This does not authorize changing other fields.
+  Never list a correction merely to make a reconstructed proposal pass validation.
 - Resolve ONLY information supplied by the original request or clarification
   answers. Answering one question never supplies an answer to another unresolved
   quantity, target, or required option.

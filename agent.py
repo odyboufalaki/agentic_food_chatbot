@@ -9,15 +9,16 @@ from uuid import uuid4
 
 from pydantic import ValidationError
 
+from food_ordering.clarification import validate_pending_resolution
 from food_ordering.interpretation import ClarificationRenderer, Interpreter, MistralInterpreter, ModelFailure, TemplateClarificationRenderer
 from food_ordering.menu import load_menu, menu_context
-from food_ordering.order import ClarificationContext, ClarificationNeeded, InvalidSelection, OrderLine, build_clarification_context, change_quantity, edit_line, normalize, render_draft, render_menu, resolve_target, submission_payload
-from food_ordering.proposals import AbandonPending, Add, CancelPending, ChangeQuantity, Clarify, ClearDraft, Edit, MenuQuestion, NewOrder, Proposal, RemoveLine, RetrySubmission, Review, Submit, Summary, Unsupported
+from food_ordering.order import ClarificationContext, ClarificationNeeded, InvalidSelection, OrderLine, build_clarification_context, change_quantity, display_groups, edit_servings, normalize, render_draft, render_menu, resolve_target, submission_payload
+from food_ordering.proposals import AbandonPending, Add, CancelPending, ChangeQuantity, Clarify, ClearDraft, Edit, MenuQuestion, NewOrder, Proposal, RemoveLine, RetrySubmission, Review, SetInstructions, Submit, Summary, Unsupported
 from food_ordering.submission import MCPSubmitter, Submitter, render_receipt
 from food_ordering.turn_logging import TurnLogger
 
 
-DRAFT_CHANGE_TYPES = (Add, Edit, ChangeQuantity, RemoveLine, ClearDraft, NewOrder)
+DRAFT_CHANGE_TYPES = (Add, Edit, ChangeQuantity, RemoveLine, ClearDraft, NewOrder, SetInstructions)
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class FoodOrderAgent:
                                         else TemplateClarificationRenderer())
         self._menu = load_menu()
         self._lines: list[OrderLine] = []
+        self._instructions = ""
         self._next_line_number = 1
         self._history: deque[dict[str, str]] = deque(maxlen=12)
         self._logger = TurnLogger(log_path)
@@ -90,7 +92,10 @@ class FoodOrderAgent:
                 message=message, menu=menu_context(self._menu),
                 draft=[line.snapshot() for line in self._lines], history=[dict(entry) for entry in self._history],
                 order_state={"status": self._status, "revision": self._revision,
-                             "reviewed_revision": self._reviewed_revision},
+                             "reviewed_revision": self._reviewed_revision,
+                             "instructions": self._instructions,
+                             "display_groups": [[line.line_id for line in group]
+                                                for group in display_groups(self._lines)]},
                 pending_clarification=pending_at_start.snapshot() if pending_at_start is not None else None,
             ))
             if any(isinstance(operation, CancelPending) for operation in proposal.operations):
@@ -98,7 +103,7 @@ class FoodOrderAgent:
                     raise InvalidSelection("There is no single pending change to cancel.")
                 self._pending_change = None
                 raise TurnHandled(
-                    {"message": "Pending change canceled.\n" + render_draft(self._lines)},
+                    {"message": "Pending change canceled.\n" + render_draft(self._lines, self._instructions)},
                     [{"type": "cancel_pending"}],
                 )
             abandoning = any(isinstance(operation, AbandonPending) for operation in proposal.operations)
@@ -112,12 +117,15 @@ class FoodOrderAgent:
                 remaining = proposal.operations[1:]
                 if not remaining:
                     raise TurnHandled(
-                        {"message": "Pending change abandoned.\n" + render_draft(self._lines)},
+                        {"message": "Pending change abandoned.\n" + render_draft(self._lines, self._instructions)},
                         [{"type": "abandon_pending"}],
                     )
                 proposal = Proposal(operations=remaining)
                 lifecycle_operations.append({"type": "abandon_pending"})
             clears_pending = any(isinstance(operation, ClearDraft) for operation in proposal.operations)
+            if (pending_at_start is not None and not abandoned_pending and not clears_pending
+                    and any(isinstance(operation, DRAFT_CHANGE_TYPES) for operation in proposal.operations)):
+                validate_pending_resolution(pending_at_start.proposal, proposal, self._menu)
             clarification = next((operation for operation in proposal.operations if isinstance(operation, Clarify)), None)
             if clarification is not None:
                 preserve_pending_proposal = (
@@ -151,6 +159,7 @@ class FoodOrderAgent:
                     }
                     raise InvalidSelection(explanations[operation.reason])
             candidate = list(self._lines)
+            instructions = self._instructions
             next_line_number = self._next_line_number
             validated_operations = []
             answers = []
@@ -163,10 +172,10 @@ class FoodOrderAgent:
                     validated_operations.append({"type": "add", **line.snapshot()})
                     changed = True
                 elif isinstance(operation, Edit):
-                    line = resolve_target(operation.target, candidate)
-                    updated = edit_line(operation, line, self._menu)
-                    candidate[candidate.index(line)] = updated
-                    validated_operations.append({"type": "edit", **updated.snapshot()})
+                    candidate, next_line_number, edits = edit_servings(
+                        operation, candidate, self._menu, next_line_number,
+                    )
+                    validated_operations.extend(edits)
                     changed = True
                 elif isinstance(operation, ChangeQuantity):
                     line = resolve_target(operation.target, candidate)
@@ -188,10 +197,16 @@ class FoodOrderAgent:
                 elif isinstance(operation, ClearDraft):
                     validated_operations.append({"type": "clear_draft", "line_ids": [line.line_id for line in candidate]})
                     candidate.clear()
+                    instructions = ""
                     changed = True
                 elif isinstance(operation, NewOrder):
                     candidate.clear()
+                    instructions = ""
                     validated_operations.append(operation.model_dump())
+                    changed = True
+                elif isinstance(operation, SetInstructions):
+                    instructions = operation.instructions.strip()
+                    validated_operations.append({"type": "set_instructions", "instructions": instructions})
                     changed = True
                 else:
                     if isinstance(operation, MenuQuestion):
@@ -199,9 +214,9 @@ class FoodOrderAgent:
                     validated_operations.append(operation.model_dump())
             if changed or any(isinstance(operation, Summary) for operation in proposal.operations):
                 if self._status == "submitted" and not changed:
-                    answers.append(self._receipt_message + "\n" + render_draft(candidate).removeprefix("Draft order:\n"))
+                    answers.append(self._receipt_message + "\n" + render_draft(candidate, instructions).removeprefix("Draft order:\n"))
                 else:
-                    answers.append(render_draft(candidate))
+                    answers.append(render_draft(candidate, instructions))
             response: dict[str, Any] = {"message": "\n\n".join(answers)}
             if pending_at_start is not None and changed and not abandoned_pending and not clears_pending:
                 lifecycle_operations.append({
@@ -209,6 +224,7 @@ class FoodOrderAgent:
                 })
             operations = lifecycle_operations + validated_operations
             self._lines = candidate
+            self._instructions = instructions
             self._next_line_number = next_line_number
             if changed:
                 draft_changed = True
@@ -232,17 +248,17 @@ class FoodOrderAgent:
                 elif self._status == "rejected" and (review_requested or (retry_requested and self._retry_requires_review)):
                     self._status = "draft"
                     self._reviewed_revision = self._revision
-                    response["message"] = render_draft(self._lines) + "\nPlease confirm: submit this exact order?"
+                    response["message"] = render_draft(self._lines, self._instructions) + "\nPlease confirm: submit this exact order?"
                 elif self._status == "rejected" and not retry_requested:
                     response["message"] = "The previous submission was rejected. You may explicitly request another attempt or edit the order and review it again."
                 else:
-                    payload = self._rejected_payload if self._status == "rejected" else submission_payload(self._lines, self._menu)
+                    payload = self._rejected_payload if self._status == "rejected" else submission_payload(self._lines, self._menu, self._instructions)
                     if payload is None:
                         raise InvalidSelection("There is no rejected submission available to retry.")
                     if self._status == "draft" and (retry_requested or review_requested or changed
                                                     or self._reviewed_revision != self._revision):
                         self._reviewed_revision = self._revision
-                        response["message"] = render_draft(self._lines) + "\nPlease confirm: submit this exact order?"
+                        response["message"] = render_draft(self._lines, self._instructions) + "\nPlease confirm: submit this exact order?"
                     else:
                         frozen = json.dumps(payload)
                         if self._application_error_payload == payload:
@@ -312,7 +328,7 @@ class FoodOrderAgent:
                     "No changes have been applied."
                 )}
             else:
-                response = {"message": (render_draft(self._lines) + f"\n{error} The order was not submitted.")
+                response = {"message": (render_draft(self._lines, self._instructions) + f"\n{error} The order was not submitted.")
                         if draft_changed else f"{error} Your draft is unchanged. Please restate the complete request."}
         except ValidationError:
             failed_conversation_turn = True

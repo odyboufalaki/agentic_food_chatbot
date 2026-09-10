@@ -3,7 +3,8 @@
 Ask about the assignment menu and build, edit, or clear an in-memory, priced draft
 through natural language. Python validates and prices the order; Mistral
 interprets requests into typed proposals. Review a valid order, explicitly confirm
-it, and receive a restaurant receipt through MCP (tickets 01–04).
+it, and receive a restaurant receipt through MCP. Individual servings and
+preparation instructions can be customized before approval.
 
 ## Setup
 
@@ -101,6 +102,34 @@ A request such as "review for checkout" always displays a review and never count
 as approval, even if a prior review was eligible. The separate `review` operation
 enforces this distinction; only `submit` or `confirm` can authorize an invocation.
 
+For the serving-customization demo, start with a fresh order:
+
+```text
+Two burgers
+Make one chicken with no onions
+Review
+Yes
+```
+
+The first summary groups the two beef burgers at $17.00. The edit shows one beef
+and one chicken burger, with “no onions” only on the chicken serving, still $17.00.
+Review includes the instruction; only the final approval invokes the restaurant.
+The single `special_instructions` string identifies the affected payload item,
+quantity, and configuration. General requests such as “no cutlery” remain separate
+from item notes and survive removal of food. Changing notes requires fresh approval.
+
+Two further conversation checks (each in a fresh order):
+
+- “I want milkshakes” → quantity question; “2” → flavor question;
+  “vanilla and strawberry” → exactly one of each, total $11.00.
+- Add a strawberry milkshake, then a chocolate milkshake. “Make the milkshake
+  large” must ask which selection; “the strawberry one” produces a large
+  strawberry and a regular chocolate milkshake, total $13.00.
+
+These examples are covered with controlled model responses in
+`tests/test_customization.py`; the burger demo also runs through the CLI test.
+Live language interpretation remains a separate evaluation.
+
 ## Design
 
 - `agent.py`: one conversation, active draft, atomic turn coordination and public API.
@@ -116,15 +145,26 @@ enforces this distinction; only `submit` or `confirm` can authorize an invocatio
   before any change is committed. Repeated extras
   charge once; separately added lines receive short, stable session-local IDs
   (`L1`, `L2`, ...). IDs are allocated only when an atomic change commits and are
-  never reused after a line is removed or the draft is cleared. Stored lines
-  reserve an empty item-instruction field for later work.
+  never reused after a line is removed or the draft is cleared. Plain-text item
+  notes survive resizing and splitting. Identical configurations and notes are
+  grouped only for display, with a mapping back to distinct stored lines.
 - Draft changes use separate `edit`, `set_quantity`, `increase_quantity`,
   `remove_units`, `remove_line`, and `clear_draft` operations. Targets match a
-  current line ID or item ID with optional current options/extras. Exactly one
-  line must match; nonexistent or ambiguous targets reject the whole message.
+  current line ID or item ID with optional current options/extras/instructions.
+  Edits with an explicit quantity or “all” visit matching lines in stored order
+  and split only when some servings acquire a different configuration.
+  Otherwise exactly one line must match; ambiguous targets require clarification.
   Edits preserve surviving line IDs and reprice supported choices from the menu.
   A set quantity must be positive; zero remaining servings uses explicit line
   removal. Removing more servings than exist is rejected.
+- General notes use `set_instructions`; item notes use `add.instructions` or
+  `edit.instructions`. Empty text clears notes. Replacing a product with notes
+  asks whether to keep or discard them. Notes are not purchasable extras and
+  cannot establish dietary guarantees.
+- `clarification.py` checks reconstructed pending proposals against established
+  quantities, targets, options, extras, and instructions. Split additions must
+  conserve the established quantity. An explicit correction is represented by
+  `corrected_fields` paths such as `0.quantity`; only those fields may change.
 - `interpretation.py`: direct synchronous Mistral SDK integration using
   [custom structured output](https://docs.mistral.ai/studio/conversations/structured-output/custom).
   It receives menu data, a fresh draft snapshot, submission status, current and
@@ -232,11 +272,11 @@ tested at the public deterministic submission validator using a boundary menu.
 
 ## Current limitations
 
-This slice adds, edits, and removes selections, clears unsubmitted drafts,
-answers menu questions, resolves missing choices and ambiguous changes, reviews,
-and submits confirmed orders. Splitting some servings into another configuration,
-changing multiple matching lines as a group, grouping identical displayed lines,
-product replacement, and preparation instructions are later tickets.
+This application adds, edits, and removes selections, customizes explicit servings,
+groups identical displayed selections, retains preparation instructions, clears
+unsubmitted drafts, resolves missing choices and ambiguous changes, reviews,
+and submits confirmed orders. Stored lines remain distinct even when displayed
+together. Whole-line quantity adjustments still require a unique target.
 If a required choice is missing, such as milkshake flavor, the whole proposal is
 held until the customer answers or cancels it. An over-$50 draft
 stays open to additions and edits, but cannot be submitted until within the limit.
