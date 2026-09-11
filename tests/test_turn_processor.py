@@ -51,7 +51,7 @@ def test_model_can_read_menu_result_then_complete_a_natural_response() -> None:
 
     assert response == {"message": "We have burgers, pizza, sides, drinks, and desserts."}
     assert [tool.name for tool in model.tool_specs[0]] == [
-        "show_menu", "show_draft", "add_item",
+        "show_menu", "show_draft", "add_item", "update_item",
     ]
     result = model.requests[1][-1]
     assert isinstance(result, ToolResultMessage)
@@ -272,7 +272,7 @@ def test_tool_call_budget_pairs_the_over_budget_call_with_an_aborted_result() ->
     }
 
 
-def test_processor_rejects_unimplemented_mutation_and_leaves_state_unchanged() -> None:
+def test_processor_rejects_unimplemented_replacement_and_leaves_state_unchanged() -> None:
     line = OrderLine(
         item_id="fries",
         name="French Fries",
@@ -312,7 +312,7 @@ def test_processor_rejects_unimplemented_mutation_and_leaves_state_unchanged() -
             name="update_item",
             arguments={
                 "target": {"type": "line", "line_id": "L2"},
-                "change": {"type": "customize", "add_extras": ["parmesan"]},
+                "change": {"type": "replace", "item_id": "onion_rings"},
             },
         ),)),
         AssistantMessage(content="I can't make that change in this flow."),
@@ -522,7 +522,7 @@ def test_valid_burgers_commit_while_incomplete_milkshake_asks_for_flavor() -> No
         "Total: $17.00"
     )}
     assert [tool.name for tool in model.tool_specs[0]] == [
-        "show_menu", "show_draft", "add_item",
+        "show_menu", "show_draft", "add_item", "update_item",
     ]
     results = model.requests[1][-2:]
     assert all(isinstance(result, ToolResultMessage) for result in results)
@@ -953,6 +953,473 @@ def test_menu_extra_cannot_bypass_validation_through_item_instructions() -> None
     assert session.lines == []
     assert session.revision == 0
     assert session.next_line_number == 1
+
+
+def test_customizing_one_of_three_burgers_splits_the_selected_serving() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="one-chicken-burger",
+            name="update_item",
+            arguments={
+                "target": {"type": "match", "item_id": "classic_burger"},
+                "servings": 1,
+                "change": {
+                    "type": "customize",
+                    "options": {"patty": "chicken"},
+                },
+            },
+        ),)),
+        AssistantMessage(content="I made one burger chicken."),
+    )
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1",
+            item_id="classic_burger",
+            name="Classic Burger",
+            quantity=3,
+            options=(("size", "regular"), ("patty", "beef")),
+            extras=(),
+            instructions="",
+            unit_cents=850,
+        )],
+        next_line_number=2,
+        revision=1,
+    )
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Make one burger chicken",
+    )
+
+    assert [
+        (line.line_id, line.quantity, dict(line.options), line.unit_cents)
+        for line in session.lines
+    ] == [
+        ("L1", 2, {"size": "regular", "patty": "beef"}, 850),
+        ("L2", 1, {"size": "regular", "patty": "chicken"}, 850),
+    ]
+    assert sum(line.quantity for line in session.lines) == 3
+    assert session.next_line_number == 3
+    assert session.revision == 2
+
+
+def test_ambiguous_milkshake_customization_returns_matching_lines_unchanged() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="ambiguous-shake",
+            name="update_item",
+            arguments={
+                "target": {"type": "match", "item_id": "milkshake"},
+                "change": {"type": "customize", "options": {"size": "large"}},
+            },
+        ),)),
+        AssistantMessage(content="Which milkshake should I make large?"),
+    )
+    session = Session(
+        lines=[
+            OrderLine(
+                line_id="L1", item_id="milkshake", name="Milkshake", quantity=1,
+                options=(("size", "regular"), ("flavor", "chocolate")),
+                extras=(), instructions="", unit_cents=550,
+            ),
+            OrderLine(
+                line_id="L2", item_id="milkshake", name="Milkshake", quantity=1,
+                options=(("size", "regular"), ("flavor", "strawberry")),
+                extras=(), instructions="", unit_cents=550,
+            ),
+        ],
+        next_line_number=3,
+        revision=2,
+    )
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Make the milkshake large",
+    )
+
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    payload = _payload(result)
+    assert payload["outcome"] == "INCOMPLETE"
+    assert payload["key"] == "target"
+    assert [choice["value"] for choice in payload["alternatives"]] == ["L1", "L2"]
+    assert "chocolate" in payload["alternatives"][0]["label"]
+    assert "strawberry" in payload["alternatives"][1]["label"]
+    assert [(line.line_id, dict(line.options)) for line in session.lines] == [
+        ("L1", {"size": "regular", "flavor": "chocolate"}),
+        ("L2", {"size": "regular", "flavor": "strawberry"}),
+    ]
+    assert session.revision == 2
+    assert session.next_line_number == 3
+
+
+def test_explicit_servings_customize_earliest_matching_lines_first() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="earliest-burgers",
+            name="update_item",
+            arguments={
+                "target": {"type": "match", "item_id": "classic_burger"},
+                "servings": 2,
+                "change": {"type": "customize", "add_extras": ["cheese"]},
+            },
+        ),)),
+        AssistantMessage(content="I added cheese to the first two burgers."),
+    )
+    session = Session(
+        lines=[
+            OrderLine(
+                line_id="L1", item_id="classic_burger", name="Classic Burger",
+                quantity=1, options=(("size", "regular"), ("patty", "beef")),
+                extras=(), instructions="", unit_cents=850,
+            ),
+            OrderLine(
+                line_id="L2", item_id="classic_burger", name="Classic Burger",
+                quantity=2, options=(("size", "regular"), ("patty", "beef")),
+                extras=(), instructions="", unit_cents=850,
+            ),
+        ],
+        next_line_number=3,
+        revision=2,
+    )
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Add cheese to two burgers",
+    )
+
+    assert [
+        (line.line_id, line.quantity, line.extras, line.unit_cents)
+        for line in session.lines
+    ] == [
+        ("L1", 1, ("cheese",), 950),
+        ("L2", 1, (), 850),
+        ("L3", 1, ("cheese",), 950),
+    ]
+    assert session.revision == 3
+    assert session.next_line_number == 4
+
+
+def test_customization_rejects_more_servings_than_match_without_mutation() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="too-many-burgers",
+            name="update_item",
+            arguments={
+                "target": {"type": "match", "item_id": "classic_burger"},
+                "servings": 4,
+                "change": {"type": "customize", "options": {"size": "large"}},
+            },
+        ),)),
+        AssistantMessage(content="Only three matching burgers are selected."),
+    )
+    original = OrderLine(
+        line_id="L1", item_id="classic_burger", name="Classic Burger", quantity=3,
+        options=(("size", "regular"), ("patty", "beef")), extras=(),
+        instructions="", unit_cents=850,
+    )
+    session = Session(lines=[original], next_line_number=2, revision=1)
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Make four burgers large",
+    )
+
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    assert _payload(result) == {
+        "outcome": "INCOMPLETE",
+        "remedy": "ask_customer",
+        "reason": "Only 3 matching servings are selected.",
+        "resolution": "Ask the customer to choose from 1 to 3 matching servings.",
+        "subject": "Classic Burger",
+        "key": "servings",
+        "constraint": {"minimum": 1, "maximum": 3},
+    }
+    assert session.lines == [original]
+    assert session.revision == 1
+    assert session.next_line_number == 2
+
+
+def test_all_customization_preserves_stored_ids_and_groups_only_for_display() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="all-burgers",
+            name="update_item",
+            arguments={
+                "target": {"type": "match", "item_id": "classic_burger"},
+                "servings": "all",
+                "change": {"type": "customize", "options": {"size": "large"}},
+            },
+        ),)),
+        AssistantMessage(content="I made all burgers large."),
+    )
+    session = Session(
+        lines=[
+            OrderLine(
+                line_id="L1", item_id="classic_burger", name="Classic Burger",
+                quantity=1, options=(("size", "regular"), ("patty", "beef")),
+                extras=(), instructions="", unit_cents=850,
+            ),
+            OrderLine(
+                line_id="L2", item_id="classic_burger", name="Classic Burger",
+                quantity=2, options=(("size", "regular"), ("patty", "beef")),
+                extras=(), instructions="", unit_cents=850,
+            ),
+        ],
+        next_line_number=3,
+        revision=2,
+    )
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Make all burgers large",
+    )
+
+    assert [
+        (line.line_id, line.quantity, dict(line.options), line.unit_cents)
+        for line in session.lines
+    ] == [
+        ("L1", 1, {"size": "large", "patty": "beef"}, 1050),
+        ("L2", 2, {"size": "large", "patty": "beef"}, 1050),
+    ]
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    group = _payload(result)["draft"]["display_groups"]
+    assert [(entry["line_ids"], entry["quantity"], entry["total_cents"]) for entry in group] == [
+        (["L1", "L2"], 3, 3150),
+    ]
+    assert session.next_line_number == 3
+    assert session.revision == 3
+
+
+@pytest.mark.parametrize(
+    ("change", "selected_instructions"),
+    [
+        ({"options": {"size": "large"}}, "no onions"),
+        ({"instructions": ""}, ""),
+        ({"instructions": "cut in half"}, "cut in half"),
+    ],
+)
+def test_split_customization_preserves_clears_or_replaces_selected_instructions(
+    change: dict[str, Any],
+    selected_instructions: str,
+) -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="instruction-patch",
+            name="update_item",
+            arguments={
+                "target": {"type": "line", "line_id": "L1"},
+                "servings": 1,
+                "change": {"type": "customize", **change},
+            },
+        ),)),
+        AssistantMessage(content="I updated one burger."),
+    )
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1", item_id="classic_burger", name="Classic Burger", quantity=2,
+            options=(("size", "regular"), ("patty", "beef")), extras=(),
+            instructions="no onions", unit_cents=850,
+        )],
+        next_line_number=2,
+        revision=1,
+    )
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Customize one burger",
+    )
+
+    assert [(line.line_id, line.quantity, line.instructions) for line in session.lines] == [
+        ("L1", 1, "no onions"),
+        ("L2", 1, selected_instructions),
+    ]
+    snapshot = _payload(model.requests[1][-1])
+    assert [
+        group["instructions"] for group in snapshot["draft"]["display_groups"]
+    ] == ["no onions", selected_instructions]
+
+
+def test_idempotent_customization_is_already_applied_without_a_new_revision() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="same-cheese",
+            name="update_item",
+            arguments={
+                "target": {"type": "line", "line_id": "L1"},
+                "change": {
+                    "type": "customize",
+                    "add_extras": ["cheese", "cheese"],
+                },
+            },
+        ),)),
+        AssistantMessage(content="That burger already has cheese."),
+    )
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1", item_id="classic_burger", name="Classic Burger", quantity=1,
+            options=(("size", "regular"), ("patty", "beef")), extras=("cheese",),
+            instructions="", unit_cents=950,
+        )],
+        next_line_number=2,
+        revision=4,
+    )
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Add cheese to that burger",
+    )
+
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    assert _payload(result)["outcome"] == "ALREADY_APPLIED"
+    assert _payload(result)["operation"] == "update_item"
+    assert [(line.line_id, line.extras, line.unit_cents) for line in session.lines] == [
+        ("L1", ("cheese",), 950),
+    ]
+    assert session.revision == 4
+    assert session.next_line_number == 2
+
+
+def test_customization_rejects_an_invalid_recognized_option_value() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="invalid-patty",
+            name="update_item",
+            arguments={
+                "target": {"type": "line", "line_id": "L1"},
+                "change": {"type": "customize", "options": {"patty": "fish"}},
+            },
+        ),)),
+        AssistantMessage(content="Which supported patty would you like?"),
+    )
+    original = OrderLine(
+        line_id="L1", item_id="classic_burger", name="Classic Burger", quantity=1,
+        options=(("size", "regular"), ("patty", "beef")), extras=(),
+        instructions="", unit_cents=850,
+    )
+    session = Session(lines=[original], next_line_number=2, revision=1)
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Make the burger a fish patty",
+    )
+
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    payload = _payload(result)
+    assert payload["outcome"] == "INCOMPLETE"
+    assert payload["key"] == "patty"
+    assert [choice["value"] for choice in payload["alternatives"]] == [
+        "beef", "chicken", "veggie",
+    ]
+    assert session.lines == [original]
+    assert session.revision == 1
+
+
+@pytest.mark.parametrize(
+    ("change", "expected_key"),
+    [
+        ({"options": {"temperature": "hot"}}, "temperature"),
+        ({"add_extras": ["pickles"]}, "extras"),
+        ({"remove_extras": ["bacon"]}, "extras"),
+        ({"add_extras": ["cheese"], "remove_extras": ["cheese"]}, "extras"),
+        ({"instructions": "add bacon"}, "instructions"),
+    ],
+)
+def test_invalid_customizations_are_rejected_without_mutating_the_draft(
+    change: dict[str, Any],
+    expected_key: str,
+) -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="invalid-customization",
+            name="update_item",
+            arguments={
+                "target": {"type": "line", "line_id": "L1"},
+                "change": {"type": "customize", **change},
+            },
+        ),)),
+        AssistantMessage(content="That customization is not available."),
+    )
+    original = OrderLine(
+        line_id="L1", item_id="classic_burger", name="Classic Burger", quantity=1,
+        options=(("size", "regular"), ("patty", "beef")), extras=(),
+        instructions="", unit_cents=850,
+    )
+    session = Session(lines=[original], next_line_number=2, revision=1)
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Apply an unavailable customization",
+    )
+
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    payload = _payload(result)
+    assert payload["outcome"] == "UNSATISFIABLE"
+    assert payload["key"] == expected_key
+    assert session.lines == [original]
+    assert session.revision == 1
+    assert session.next_line_number == 2
+
+
+def test_customization_uses_extra_set_semantics_and_reprices_the_line() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="change-extras",
+            name="update_item",
+            arguments={
+                "target": {"type": "line", "line_id": "L1"},
+                "change": {
+                    "type": "customize",
+                    "add_extras": ["cheese", "cheese"],
+                    "remove_extras": ["bacon"],
+                },
+            },
+        ),)),
+        AssistantMessage(content="I replaced bacon with cheese."),
+    )
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1", item_id="classic_burger", name="Classic Burger", quantity=1,
+            options=(("size", "regular"), ("patty", "beef")), extras=("bacon",),
+            instructions="", unit_cents=1000,
+        )],
+        next_line_number=2,
+        revision=1,
+    )
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Replace the bacon with cheese",
+    )
+
+    assert [
+        (line.line_id, line.extras, line.unit_cents, line.total_cents)
+        for line in session.lines
+    ] == [
+        ("L1", ("cheese",), 950, 950),
+    ]
+    assert session.revision == 2
+
+
+def test_customization_rejects_a_missing_line_id_target() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="missing-line",
+            name="update_item",
+            arguments={
+                "target": {"type": "line", "line_id": "L99"},
+                "change": {"type": "customize", "options": {"size": "large"}},
+            },
+        ),)),
+        AssistantMessage(content="That line is not in the draft."),
+    )
+    session = Session()
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Make line 99 large",
+    )
+
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    assert _payload(result)["outcome"] == "UNSATISFIABLE"
+    assert _payload(result)["key"] == "target"
+    assert session.lines == []
+    assert session.revision == 0
 
 
 def test_unlisted_addition_cannot_bypass_validation_through_item_instructions() -> None:

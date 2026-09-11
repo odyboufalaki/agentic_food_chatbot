@@ -1,6 +1,6 @@
 """Bounded, provider-neutral orchestration for one customer turn."""
 
-from food_ordering.draft_operations import validate_add_item
+from food_ordering.draft_operations import validate_add_item, validate_customize_item
 from food_ordering.menu import Menu
 from food_ordering.model_adapter import (
     AbortReason,
@@ -39,6 +39,7 @@ from food_ordering.tool_protocol import (
     ShowMenu,
     StoredLineSnapshot,
     Unsatisfiable,
+    UpdateItem,
     Valid,
     parse_tool_call,
     protocol_schema,
@@ -58,6 +59,7 @@ def _tool_specs() -> tuple[ToolSpec, ...]:
         "show_menu": "Return the complete Menu or the requested menu items.",
         "show_draft": "Return the complete authoritative Draft order.",
         "add_item": "Add one configured menu item to the Draft order.",
+        "update_item": "Customize selected servings in the Draft order.",
     }
     return tuple(
         ToolSpec(name=name, parameters=schemas[name], description=description)
@@ -345,18 +347,47 @@ class TurnProcessor:
                 result=_draft_snapshot(self._session),
             )
             return ToolResultMessage(call.call_id, call.name, payload)
-        if isinstance(operation, AddItem):
-            validation = validate_add_item(
-                operation,
-                DraftState(
-                    lines=tuple(self._session.lines),
-                    general_instructions=self._session.instructions,
-                    next_line_number=self._session.next_line_number,
-                ),
-                self._menu,
+        if isinstance(operation, (AddItem, UpdateItem)):
+            if isinstance(operation, AddItem):
+                validation = validate_add_item(
+                    operation,
+                    DraftState(
+                        lines=tuple(self._session.lines),
+                        general_instructions=self._session.instructions,
+                        next_line_number=self._session.next_line_number,
+                    ),
+                    self._menu,
+                )
+            else:
+                if operation.change.type != "customize":
+                    return ToolResultMessage(call.call_id, call.name, Unsatisfiable(
+                        outcome="UNSATISFIABLE",
+                        remedy="change_request",
+                        reason="Replacement is unavailable in this processor version.",
+                        resolution="Customize the existing item instead.",
+                        subject=call.name,
+                    ))
+                validation = validate_customize_item(
+                    operation,
+                    DraftState(
+                        lines=tuple(self._session.lines),
+                        general_instructions=self._session.instructions,
+                        next_line_number=self._session.next_line_number,
+                    ),
+                    self._menu,
             )
             if not isinstance(validation, Valid):
                 return ToolResultMessage(call.call_id, call.name, validation)
+            if not validation.changed:
+                return ToolResultMessage(
+                    call.call_id,
+                    call.name,
+                    AlreadyAppliedPayload(
+                        outcome="ALREADY_APPLIED",
+                        operation=call.name,
+                        draft=_draft_snapshot(self._session),
+                    ),
+                )
             self._session.commit_draft(validation.candidate)
             payload = AppliedPayload(
                 outcome="APPLIED",
