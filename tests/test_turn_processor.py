@@ -239,7 +239,7 @@ def test_exhausted_malformed_correction_budget_uses_customer_safe_fallback() -> 
     assert messages[-1] == AssistantMessage(content=response["message"])
 
 
-def test_tool_call_budget_pairs_the_over_budget_call_then_stops() -> None:
+def test_tool_call_budget_keeps_dispatched_pairs_and_rejects_the_over_budget_response() -> None:
     model = ScriptedModel(
         *(AssistantMessage(tool_calls=(
             ToolCall(call_id=f"draft-{number}", name="show_draft", arguments={}),
@@ -260,10 +260,11 @@ def test_tool_call_budget_pairs_the_over_budget_call_then_stops() -> None:
         message for message in session.transcript[0].messages
         if isinstance(message, ToolResultMessage)
     ]
-    assert len(results) == 9
-    assert [_payload(result)["outcome"] for result in results[:8]] == ["RESULT"] * 8
-    assert results[8].call_id == "draft-9"
-    assert _payload(results[8])["outcome"] == "UNSATISFIABLE"
+    assert len(results) == 8
+    assert [_payload(result)["outcome"] for result in results] == ["RESULT"] * 8
+    assert [result.call_id for result in results] == [
+        f"draft-{number}" for number in range(1, 9)
+    ]
 
 
 def test_read_only_processor_rejects_mutation_and_leaves_authoritative_state_unchanged() -> None:
@@ -393,6 +394,27 @@ def test_truncated_nonempty_model_response_is_not_customer_facing() -> None:
         "I couldn't finish that request safely. Your draft is unchanged. Please try again."
     )
     assert "validation" not in response["message"]
+
+
+def test_truncated_tool_calls_are_not_dispatched_or_added_without_results() -> None:
+    session = Session()
+    model = ScriptedModel(AssistantMessage(
+        content="I only decoded part of this call.",
+        tool_calls=(ToolCall(call_id="partial", name="show_draft", arguments={}),),
+        completion_status="truncated",
+    ))
+
+    response = TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "What is in my draft?",
+    )
+
+    assert response["message"] == (
+        "I couldn't finish that request safely. Your draft is unchanged. Please try again."
+    )
+    assert session.transcript[0].messages == (
+        CustomerMessage("What is in my draft?"),
+        AssistantMessage(content=response["message"]),
+    )
 
 
 def test_model_failure_after_a_read_result_preserves_pair_and_uses_fallback() -> None:

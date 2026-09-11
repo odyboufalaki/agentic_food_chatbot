@@ -14,6 +14,7 @@ from food_ordering.model_adapter import (
 from food_ordering.order import OrderLine, display_groups
 from food_ordering.session import Session
 from food_ordering.tool_protocol import (
+    CartInvalid,
     DisplayGroupSnapshot,
     DraftSnapshot,
     Incomplete,
@@ -133,6 +134,8 @@ def _violation_fingerprint(
 ) -> tuple[str, str | None, str | None] | None:
     if isinstance(payload, (Incomplete, Unsatisfiable)):
         return payload.outcome, payload.subject, payload.key
+    if isinstance(payload, CartInvalid):
+        return payload.outcome, None, None
     return None
 
 
@@ -161,36 +164,25 @@ class TurnProcessor:
                 response = self._model.complete(messages=messages, tools=_tool_specs())
             except Exception:
                 return self._fallback(current_turn)
+            if response.completion_status == "truncated":
+                return self._fallback(current_turn)
+            if len(response.tool_calls) > MAX_TOOL_CALLS_PER_TURN - tool_calls:
+                return self._fallback(current_turn)
             current_turn.append(response)
             messages.append(response)
             if not response.tool_calls:
-                if response.completion_status == "complete" and response.content.strip():
+                if response.content.strip():
                     self._session.transcript.append(TranscriptTurn(tuple(current_turn)))
                     return {"message": response.content}
                 return self._fallback(current_turn)
 
-            budget_exhausted = False
             repeated_violation = False
             for call in response.tool_calls:
-                if tool_calls >= MAX_TOOL_CALLS_PER_TURN:
-                    budget_exhausted = True
-                    result = ToolResultMessage(
-                        call.call_id,
-                        call.name,
-                        Unsatisfiable(
-                            outcome="UNSATISFIABLE",
-                            remedy="change_request",
-                            reason="The per-turn tool-call limit was reached.",
-                            resolution="Wait for a new customer turn before using another tool.",
-                            subject="turn tool-call budget",
-                        ),
-                    )
-                else:
-                    tool_calls += 1
-                    result = self._dispatch(call)
+                tool_calls += 1
+                result = self._dispatch(call)
                 current_turn.append(result)
                 messages.append(result)
-                if not budget_exhausted and isinstance(result.payload, Malformed):
+                if isinstance(result.payload, Malformed):
                     malformed_calls += 1
                 fingerprint = _violation_fingerprint(result.payload)
                 if fingerprint is not None:
@@ -198,8 +190,7 @@ class TurnProcessor:
                         repeated_violation = True
                     violations.add(fingerprint)
             if (
-                budget_exhausted
-                or repeated_violation
+                repeated_violation
                 or malformed_calls > MAX_MALFORMED_CORRECTIONS
             ):
                 return self._fallback(current_turn)
