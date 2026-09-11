@@ -4,16 +4,13 @@ import json
 from collections.abc import Mapping, Sequence
 from typing import Any, Literal
 
-import httpx
 from mistralai.client import Mistral, models
-from mistralai.client.errors import MistralError, ResponseValidationError
+from mistralai.client.errors import ResponseValidationError
 
 from food_ordering.mistral_support import (
     ModelFailure,
     Settings,
-    client_context,
-    error_category,
-    validate_configuration,
+    run_bounded_request,
 )
 from food_ordering.model_adapter import (
     AssistantMessage,
@@ -50,7 +47,6 @@ class MistralToolModel:
         messages: Sequence[ModelMessage],
         tools: Sequence[ToolSpec],
     ) -> AssistantMessage:
-        self._validate_configuration()
         provider_messages = self._provider_messages(messages)
         provider_tools: list[models.ChatCompletionRequestTool] = [
             models.Tool(function=models.Function(
@@ -60,37 +56,24 @@ class MistralToolModel:
             ))
             for tool in tools
         ]
-        with client_context(self._settings, self._client) as client:
-            for attempt in range(2):
-                try:
-                    response = client.chat.complete(
-                        model=self._settings.model,
-                        messages=provider_messages,
-                        tools=provider_tools,
-                        tool_choice="auto",
-                        parallel_tool_calls=True,
-                        temperature=0,
-                        retries=None,
-                        timeout_ms=self._settings.timeout_ms,
-                        max_tokens=4096,
-                    )
-                    return self._assistant_message(response)
-                except httpx.TimeoutException:
-                    category = "model_timeout"
-                except httpx.TransportError:
-                    category = "model_unavailable"
-                except MistralError as error:
-                    category = error_category(error)
-                    if category in {"authentication", "configuration", "model_error"}:
-                        raise ModelFailure(category) from None
-                except (ResponseValidationError, ValueError, TypeError):
-                    raise ModelFailure("invalid_structured_output") from None
-                if attempt == 1:
-                    raise ModelFailure(category) from None
-        raise ModelFailure("model_error")
+        def request(client: Mistral) -> AssistantMessage:
+            try:
+                response = client.chat.complete(
+                    model=self._settings.model,
+                    messages=provider_messages,
+                    tools=provider_tools,
+                    tool_choice="auto",
+                    parallel_tool_calls=True,
+                    temperature=0,
+                    retries=None,
+                    timeout_ms=self._settings.timeout_ms,
+                    max_tokens=4096,
+                )
+                return self._assistant_message(response)
+            except (ResponseValidationError, ValueError, TypeError):
+                raise ModelFailure("invalid_structured_output") from None
 
-    def _validate_configuration(self) -> None:
-        validate_configuration(self._settings, self._client)
+        return run_bounded_request(self._settings, self._client, request)
 
     @staticmethod
     def _provider_messages(

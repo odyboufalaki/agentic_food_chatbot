@@ -1,16 +1,16 @@
 import json
 from typing import Any, Protocol
 
-import httpx
 from mistralai.client import Mistral, models
-from mistralai.client.errors import MistralError, ResponseValidationError
+from mistralai.client.errors import ResponseValidationError
 from pydantic import ValidationError
 
 from food_ordering.mistral_support import (
     ModelFailure as ModelFailure,
+    RetryableModelFailure,
     Settings as Settings,
     client_context,
-    error_category,
+    run_bounded_request,
     validate_configuration,
 )
 from food_ordering.order import ClarificationContext, ResponseContext
@@ -345,7 +345,6 @@ class MistralInterpreter:
         order_state: dict[str, Any] | None = None,
         pending_clarification: dict[str, Any] | None = None,
     ) -> Proposal:
-        validate_configuration(self._settings, self._client)
         context = json.dumps({"menu": menu, "draft": draft, "pending_clarification": pending_clarification,
                               "order_state": order_state}, ensure_ascii=False)
         messages: list[models.ChatCompletionRequestMessage] = [
@@ -358,47 +357,37 @@ class MistralInterpreter:
             else:
                 messages.append(models.AssistantMessage(content=entry["content"]))
         messages.append(models.UserMessage(content=message))
-        with client_context(self._settings, self._client) as client:
-            for attempt in range(2):
-                try:
-                    response = client.chat.complete(
-                        model=self._settings.model, messages=messages, temperature=0,
-                        response_format=models.ResponseFormat(
-                            type="json_schema",
-                            json_schema=models.JSONSchema(
-                                name="OrderProposal", schema_definition=Proposal.model_json_schema(), strict=True,
-                            ),
+        def request(client: Mistral) -> Proposal:
+            try:
+                response = client.chat.complete(
+                    model=self._settings.model, messages=messages, temperature=0,
+                    response_format=models.ResponseFormat(
+                        type="json_schema",
+                        json_schema=models.JSONSchema(
+                            name="OrderProposal", schema_definition=Proposal.model_json_schema(), strict=True,
                         ),
-                        retries=None, timeout_ms=self._settings.timeout_ms,
-                        max_tokens=4096,
+                    ),
+                    retries=None, timeout_ms=self._settings.timeout_ms,
+                    max_tokens=4096,
+                )
+                if not response.choices or response.choices[0].message is None:
+                    raise ValueError("Missing structured proposal")
+                content = response.choices[0].message.content
+                if not isinstance(content, str) or response.choices[0].finish_reason != "stop":
+                    raise ValueError("Expected complete JSON text")
+                return Proposal.model_validate_json(content)
+            except (ValidationError, ValueError, ResponseValidationError):
+                messages.append(models.UserMessage(
+                    content=(
+                        "Return the complete proposal again, complying exactly with the JSON schema. "
+                        "An edit must change an option, extra, instruction, or item; edit.servings is "
+                        "only the number of existing servings to customize. To change the desired final "
+                        "count, use set_quantity.quantity. Do not invent missing choices."
                     )
-                    if not response.choices or response.choices[0].message is None:
-                        raise ValueError("Missing structured proposal")
-                    content = response.choices[0].message.content
-                    if not isinstance(content, str) or response.choices[0].finish_reason != "stop":
-                        raise ValueError("Expected complete JSON text")
-                    return Proposal.model_validate_json(content)
-                except (ValidationError, ValueError, ResponseValidationError):
-                    category = "invalid_structured_output"
-                    messages.append(models.UserMessage(
-                        content=(
-                            "Return the complete proposal again, complying exactly with the JSON schema. "
-                            "An edit must change an option, extra, instruction, or item; edit.servings is "
-                            "only the number of existing servings to customize. To change the desired final "
-                            "count, use set_quantity.quantity. Do not invent missing choices."
-                        )
-                    ))
-                except httpx.TimeoutException:
-                    category = "model_timeout"
-                except httpx.TransportError:
-                    category = "model_unavailable"
-                except MistralError as error:
-                    category = error_category(error)
-                    if category in {"authentication", "configuration", "model_error"}:
-                        raise ModelFailure(category) from None
-                if attempt == 1:
-                    raise ModelFailure(category) from None
-        raise ModelFailure("model_error")
+                ))
+                raise RetryableModelFailure("invalid_structured_output") from None
+
+        return run_bounded_request(self._settings, self._client, request)
 
     def render(self, clarification: ClarificationContext) -> str:
         validate_configuration(self._settings, self._client)
