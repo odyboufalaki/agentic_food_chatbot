@@ -953,3 +953,57 @@ def test_menu_extra_cannot_bypass_validation_through_item_instructions() -> None
     assert session.lines == []
     assert session.revision == 0
     assert session.next_line_number == 1
+
+
+def test_unlisted_addition_cannot_bypass_validation_through_item_instructions() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="hidden-unlisted-extra",
+            name="add_item",
+            arguments={
+                "item_id": "classic_burger",
+                "quantity": 1,
+                "instructions": "add pickles",
+            },
+        ),)),
+        AssistantMessage(content="Pickles are not a supported Extra."),
+    )
+    session = Session()
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Add a burger with pickles",
+    )
+
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    payload = _payload(result)
+    assert payload["outcome"] == "UNSATISFIABLE"
+    assert payload["key"] == "instructions"
+    assert payload["note"] == "Instruction requested the unselected addition pickles."
+    assert session.lines == []
+    assert session.revision == 0
+
+
+def test_negative_item_instruction_is_preserved_without_selecting_the_extra() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="negative-instruction",
+            name="add_item",
+            arguments={
+                "item_id": "classic_burger",
+                "quantity": 1,
+                "instructions": "no bacon",
+            },
+        ),)),
+        AssistantMessage(content="Added the burger without bacon."),
+    )
+    session = Session()
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Add a burger, no bacon",
+    )
+
+    assert [(line.item_id, line.instructions) for line in session.lines] == [
+        ("classic_burger", "no bacon"),
+    ]
+    assert session.revision == 1

@@ -1,5 +1,6 @@
 from dataclasses import dataclass, replace
-from typing import Any, Literal, Protocol
+import re
+from typing import Any, Literal, Protocol, TypeAlias, assert_never
 
 from food_ordering.menu import ALIASES, Menu, money
 from food_ordering.proposals import Add, ChangeQuantity, Edit, Target
@@ -65,19 +66,85 @@ class AddSelection(Protocol):
 
 
 @dataclass(frozen=True)
-class AddSelectionIssue:
-    kind: Literal[
-        "item",
-        "option_name",
-        "required_option",
-        "option_value",
-        "extra",
-    ]
+class UnsupportedItem:
     item_id: str
-    item_name: str | None = None
-    key: str | None = None
-    value: str | None = None
-    alternatives: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class UnsupportedOption:
+    item_id: str
+    item_name: str
+    key: str
+    alternatives: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MissingRequiredOption:
+    item_id: str
+    item_name: str
+    key: str
+    alternatives: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UnsupportedOptionValue:
+    item_id: str
+    item_name: str
+    key: str
+    value: str
+    alternatives: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UnsupportedExtra:
+    item_id: str
+    item_name: str
+    value: str
+    alternatives: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class UnsupportedInstructionAddition:
+    item_id: str
+    item_name: str
+    value: str
+    alternatives: tuple[str, ...]
+
+
+AddSelectionIssue: TypeAlias = (
+    UnsupportedItem
+    | UnsupportedOption
+    | MissingRequiredOption
+    | UnsupportedOptionValue
+    | UnsupportedExtra
+    | UnsupportedInstructionAddition
+)
+
+
+_ADDITION_DIRECTIVE = re.compile(
+    r"\b(?:add|with)\s+(?!no\b|without\b)([^,;.]+)",
+    re.IGNORECASE,
+)
+_ADDITION_SEPARATOR = re.compile(r"\s+(?:and|&)\s+", re.IGNORECASE)
+
+
+def _unsupported_instruction_addition(
+    instructions: str,
+    selected_extras: tuple[str, ...],
+) -> str | None:
+    """Return an explicit free-text addition not represented by selected Extras."""
+
+    selected_labels = {extra.casefold().replace("_", " ") for extra in selected_extras}
+    for directive in _ADDITION_DIRECTIVE.finditer(instructions):
+        for raw_addition in _ADDITION_SEPARATOR.split(directive.group(1)):
+            addition = raw_addition.strip().casefold().replace("_", " ")
+            addition = re.sub(r"^(?:a|an|the|some)\s+", "", addition)
+            addition = re.sub(r"\s+please$", "", addition)
+            if addition.startswith(("no ", "without ")):
+                continue
+            if addition not in selected_labels:
+                return raw_addition.strip()
+    return None
 
 
 def build_clarification_context(
@@ -154,14 +221,13 @@ def normalize_add_selection(
     item_id = ALIASES.get(selection.item_id, selection.item_id)
     item = next((item for item in menu.menu if item.id == item_id), None)
     if item is None:
-        return AddSelectionIssue(kind="item", item_id=selection.item_id)
+        return UnsupportedItem(item_id=selection.item_id)
     unsupported_option = next(
         (name for name in selection.options if name not in item.options),
         None,
     )
     if unsupported_option is not None:
-        return AddSelectionIssue(
-            kind="option_name",
+        return UnsupportedOption(
             item_id=item.id,
             item_name=item.name,
             key=unsupported_option,
@@ -173,8 +239,7 @@ def normalize_add_selection(
         value = selection.options.get(name, option.default)
         if value is None:
             if option.required:
-                return AddSelectionIssue(
-                    kind="required_option",
+                return MissingRequiredOption(
                     item_id=item.id,
                     item_name=item.name,
                     key=name,
@@ -182,8 +247,7 @@ def normalize_add_selection(
                 )
             continue
         if value not in option.choices:
-            return AddSelectionIssue(
-                kind="option_value",
+            return UnsupportedOptionValue(
                 item_id=item.id,
                 item_name=item.name,
                 key=name,
@@ -196,14 +260,21 @@ def normalize_add_selection(
     extras = tuple(sorted(set(selection.extras)))
     if not set(extras) <= extra_prices.keys():
         unsupported_extra = next(extra for extra in extras if extra not in extra_prices)
-        return AddSelectionIssue(
-            kind="extra",
+        return UnsupportedExtra(
             item_id=item.id,
             item_name=item.name,
             value=unsupported_extra,
             alternatives=tuple(extra_prices),
         )
     price += sum(extra_prices[extra] for extra in extras)
+    unsupported_addition = _unsupported_instruction_addition(selection.instructions, extras)
+    if unsupported_addition is not None:
+        return UnsupportedInstructionAddition(
+            item_id=item.id,
+            item_name=item.name,
+            value=unsupported_addition,
+            alternatives=tuple(extra_prices),
+        )
     return OrderLine(item.id, item.name, selection.quantity, tuple(options.items()), extras, price,
                      line_id, selection.instructions.strip())
 
@@ -212,29 +283,34 @@ def normalize(selection: Add, menu: Menu, *, line_id: str) -> OrderLine:
     result = normalize_add_selection(selection, menu, line_id=line_id)
     if isinstance(result, OrderLine):
         return result
-    if result.kind == "item":
+    if isinstance(result, UnsupportedItem):
         raise InvalidSelection("That item is not on the menu. Please choose a listed item.")
-    if result.kind == "option_name":
+    if isinstance(result, UnsupportedOption):
         raise InvalidSelection(f"Unsupported option for {result.item_name}. Please check the menu.")
-    if result.kind == "required_option":
-        key = result.key or "required option"
+    if isinstance(result, MissingRequiredOption):
         raise ClarificationNeeded(ClarificationContext(
             reason="required_option",
             fallback_question=(
-                f"Choose {key} for {result.item_name}: {', '.join(result.alternatives)}."
+                f"Choose {result.key} for {result.item_name}: {', '.join(result.alternatives)}."
             ),
             subject=result.item_name,
             field=result.key,
             choices=result.alternatives,
         ))
-    if result.kind == "option_value":
+    if isinstance(result, UnsupportedOptionValue):
         raise InvalidSelection(
             f"Choose a supported {result.key} for {result.item_name}: "
             f"{', '.join(result.alternatives)}."
         )
-    raise InvalidSelection(
-        f"Unsupported extra for {result.item_name}. Please choose a listed extra."
-    )
+    if isinstance(result, UnsupportedExtra):
+        raise InvalidSelection(
+            f"Unsupported extra for {result.item_name}. Please choose a listed extra."
+        )
+    if isinstance(result, UnsupportedInstructionAddition):
+        raise InvalidSelection(
+            "Purchasable additions must be selected from the item's listed extras."
+        )
+    assert_never(result)
 
 
 def matching_lines(target: Target, lines: list[OrderLine]) -> list[OrderLine]:

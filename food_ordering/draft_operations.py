@@ -1,9 +1,16 @@
 """Pure validators for typed Draft order operations."""
 
-import re
-
 from food_ordering.menu import Menu
-from food_ordering.order import AddSelectionIssue, OrderLine, normalize_add_selection
+from food_ordering.order import (
+    MissingRequiredOption,
+    OrderLine,
+    UnsupportedExtra,
+    UnsupportedInstructionAddition,
+    UnsupportedItem,
+    UnsupportedOption,
+    UnsupportedOptionValue,
+    normalize_add_selection,
+)
 from food_ordering.tool_protocol import (
     AddItem,
     Alternative,
@@ -32,7 +39,7 @@ def validate_add_item(
 
     line_id = f"L{draft.next_line_number}"
     normalized = normalize_add_selection(operation, menu, line_id=line_id)
-    if isinstance(normalized, AddSelectionIssue) and normalized.kind == "item":
+    if isinstance(normalized, UnsupportedItem):
         return Unsatisfiable(
             outcome="UNSATISFIABLE",
             remedy="change_request",
@@ -44,7 +51,7 @@ def validate_add_item(
                 (candidate.id, candidate.name) for candidate in menu.menu
             ]),
         )
-    if isinstance(normalized, AddSelectionIssue) and normalized.kind == "option_name":
+    if isinstance(normalized, UnsupportedOption):
         return Unsatisfiable(
             outcome="UNSATISFIABLE",
             remedy="change_request",
@@ -54,13 +61,10 @@ def validate_add_item(
             key=normalized.key,
             alternatives=_alternatives([(name, name) for name in normalized.alternatives]),
         )
-    if isinstance(normalized, AddSelectionIssue) and normalized.kind in {
-        "required_option", "option_value",
-    }:
-        assert normalized.key is not None
+    if isinstance(normalized, (MissingRequiredOption, UnsupportedOptionValue)):
         reason = (
             f"{normalized.item_name} requires a {normalized.key}."
-            if normalized.kind == "required_option"
+            if isinstance(normalized, MissingRequiredOption)
             else (
                 f"{normalized.value} is not a supported {normalized.key} "
                 f"for {normalized.item_name}."
@@ -72,7 +76,7 @@ def validate_add_item(
             reason=reason,
             resolution=(
                 f"Ask the customer to choose a {normalized.key}."
-                if normalized.kind == "required_option"
+                if isinstance(normalized, MissingRequiredOption)
                 else f"Ask the customer to choose a supported {normalized.key}."
             ),
             subject=normalized.item_name,
@@ -81,7 +85,7 @@ def validate_add_item(
                 (choice, choice) for choice in normalized.alternatives
             ]),
         )
-    if isinstance(normalized, AddSelectionIssue):
+    if isinstance(normalized, UnsupportedExtra):
         return Unsatisfiable(
             outcome="UNSATISFIABLE",
             remedy="change_request",
@@ -94,38 +98,20 @@ def validate_add_item(
             ]),
         )
 
-    assert isinstance(normalized, OrderLine)
-    instruction_text = normalized.instructions.casefold().replace("_", " ")
-    selected_extras = set(normalized.extras)
-    named_unselected_extra = next(
-        (
-            extra.id
-            for menu_item in menu.menu
-            for extra in menu_item.extras.choices
-            if extra.id not in selected_extras
-            and re.search(
-                rf"(?<!\w){re.escape(extra.id.casefold().replace('_', ' '))}(?!\w)",
-                instruction_text,
-            )
-        ),
-        None,
-    )
-    if named_unselected_extra is not None:
-        supported_extras = next(
-            item.extras.choices for item in menu.menu if item.id == normalized.item_id
-        )
+    if isinstance(normalized, UnsupportedInstructionAddition):
         return Unsatisfiable(
             outcome="UNSATISFIABLE",
             remedy="change_request",
-            reason="A Menu Extra cannot be added through Special instructions.",
+            reason="An addition cannot be added through Special instructions.",
             resolution="Select the Extra explicitly when it is supported by the item.",
-            subject=normalized.name,
+            subject=normalized.item_name,
             key="instructions",
             alternatives=_alternatives([
-                (extra.id, extra.id) for extra in supported_extras
+                (extra, extra) for extra in normalized.alternatives
             ]),
-            note=f"Instruction named the unselected Extra {named_unselected_extra}.",
+            note=f"Instruction requested the unselected addition {normalized.value}.",
         )
+    assert isinstance(normalized, OrderLine)
     return Valid(
         candidate=DraftState(
             lines=(*draft.lines, normalized),
