@@ -30,6 +30,7 @@ AbortReason: TypeAlias = Literal[
     "customer_input_required",
     "draft_mutation_in_batch",
     "model_response_truncated",
+    "submission_completed",
     "tool_call_budget_exhausted",
 ]
 

@@ -3,7 +3,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 from uuid import uuid4
 
-from food_ordering.model_adapter import TranscriptTurn
+from food_ordering.model_adapter import CustomerMessage, ModelMessage, TranscriptTurn
 from food_ordering.order import ClarificationContext, OrderLine
 from food_ordering.proposals import Proposal
 from food_ordering.tool_protocol import DraftState, ReviewSnapshot, SubmissionResult
@@ -57,6 +57,16 @@ class Session:
     application_error_payload: dict[str, Any] | None = None
     retry_requires_review: bool = False
     pending_change: PendingChange | None = None
+
+    def latest_turn_messages(self, customer_message: str) -> tuple[ModelMessage, ...]:
+        """Return the completed transcript turn for the supplied customer input."""
+
+        if not self.transcript:
+            return ()
+        messages = self.transcript[-1].messages
+        if not messages or not isinstance(messages[0], CustomerMessage):
+            return ()
+        return messages if messages[0].content == customer_message else ()
 
     def commit_draft(self, candidate: DraftState) -> None:
         """Commit one changed Draft candidate and invalidate stale checkout state."""

@@ -12,10 +12,11 @@ from food_ordering.model_adapter import (
     ToolResultMessage,
     ToolSpec,
 )
-from food_ordering.order import OrderLine
+from food_ordering.order import OrderLine, render_draft, render_menu
 from food_ordering.session import Session
 from food_ordering.submission import SubmissionResult
 from food_ordering.turn_processor import TurnProcessor
+from model_fakes import RecordingSubmitter
 
 
 EXPECTED_TOOL_NAMES = [
@@ -49,16 +50,6 @@ class ScriptedModel:
 
 def _payload(message: ToolResultMessage) -> Any:
     return message.payload.model_dump(mode="json", exclude_none=True)
-
-
-class RecordingSubmitter:
-    def __init__(self, *outcomes: SubmissionResult) -> None:
-        self._outcomes = iter(outcomes)
-        self.calls: list[dict[str, Any]] = []
-
-    def submit(self, payload: dict[str, Any]) -> SubmissionResult:
-        self.calls.append(payload)
-        return next(self._outcomes)
 
 
 def test_review_then_later_confirmation_submits_one_frozen_python_payload() -> None:
@@ -373,7 +364,8 @@ def test_rejection_allows_only_a_later_explicit_retry_of_the_frozen_payload() ->
 
     response = processor.process("Yes")
 
-    assert "Kitchen is busy" in response["message"]
+    assert response["message"].startswith("The restaurant rejected the order.")
+    assert "currently busy" in response["message"]
     assert session.status == "rejected"
     assert len(submitter.calls) == 1
     frozen_payload = submitter.calls[0]
@@ -988,7 +980,7 @@ def test_model_can_read_menu_result_then_complete_a_natural_response() -> None:
         "What is on the menu?",
     )
 
-    assert response == {"message": "We have burgers, pizza, sides, drinks, and desserts."}
+    assert response == {"message": render_menu(load_menu(), [])}
     assert [tool.name for tool in model.tool_specs[0]] == EXPECTED_TOOL_NAMES
     update_spec = next(tool for tool in model.tool_specs[0] if tool.name == "update_item")
     assert "ReplaceServings" in update_spec.parameters["$defs"]
@@ -1088,7 +1080,7 @@ def test_model_can_read_the_authoritative_draft_from_an_existing_session() -> No
         "What is in my order?",
     )
 
-    assert response == {"message": "You have two large fries with parmesan."}
+    assert response == {"message": render_draft(session.lines, session.instructions)}
     result = model.requests[1][-1]
     assert isinstance(result, ToolResultMessage)
     assert _payload(result) == {
@@ -1139,7 +1131,7 @@ def test_malformed_call_is_returned_for_one_blind_correction() -> None:
         "What is in my order?",
     )
 
-    assert response == {"message": "Your draft is empty."}
+    assert response == {"message": render_draft([], "")}
     malformed = model.requests[1][-1]
     assert isinstance(malformed, ToolResultMessage)
     assert malformed.call_id == "bad-1"
@@ -1510,7 +1502,9 @@ def test_complete_tool_pairs_are_retained_by_turn_for_later_reconstruction() -> 
         "I want fries.",
     )
 
-    assert first == {"message": "Fries are available and your draft is empty."}
+    assert first == {"message": (
+        render_menu(load_menu(), ["fries"]) + "\n\n" + render_draft([], "")
+    )}
     assert second == {"message": "What size fries would you like?"}
     first_turn = session.transcript[0].messages
     assert first_turn[0] == CustomerMessage("Do you have fries, and what is in my draft?")
@@ -1518,9 +1512,7 @@ def test_complete_tool_pairs_are_retained_by_turn_for_later_reconstruction() -> 
     assert first_turn[1].content == "Preliminary text is transcript-only."
     assert [message.call_id for message in first_turn[2:4]
             if isinstance(message, ToolResultMessage)] == ["menu", "draft"]
-    assert first_turn[-1] == AssistantMessage(
-        content="Fries are available and your draft is empty.",
-    )
+    assert first_turn[-1] == AssistantMessage(content=first["message"])
     assert model.requests[2] == first_turn + (CustomerMessage("I want fries."),)
 
 

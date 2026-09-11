@@ -31,6 +31,7 @@ from food_ordering.order import (
     OrderLine,
     display_groups,
     render_draft,
+    render_menu,
     submission_payload,
 )
 from food_ordering.session import Session
@@ -235,12 +236,16 @@ class TurnProcessor:
         session: Session,
         submitter: Submitter | None = None,
         operation_observer: Callable[[ToolCall, Operation], None] | None = None,
+        submission_observer: (
+            Callable[[dict[str, object], TransportSubmissionResult], None] | None
+        ) = None,
     ) -> None:
         self._model = model
         self._menu = menu
         self._session = session
         self._submitter = submitter if submitter is not None else MCPSubmitter()
         self._operation_observer = operation_observer
+        self._submission_observer = submission_observer
 
     def process(self, customer_message: str) -> dict[str, str]:
         self._session.turn_id += 1
@@ -262,7 +267,6 @@ class TurnProcessor:
             try:
                 response = self._model.complete(messages=messages, tools=_tool_specs())
             except Exception:
-                self._session.invalidate_review()
                 return self._fallback(current_turn, starting_revision)
             if response.completion_status == "truncated":
                 current_turn.append(response)
@@ -285,12 +289,15 @@ class TurnProcessor:
             if not response.tool_calls:
                 if response.content.strip():
                     message = self._authoritative_message(current_turn) or response.content
-                    if self._session.revision != starting_revision:
+                    if (
+                        self._session.revision != starting_revision
+                        and not self._has_draft_result(current_turn)
+                    ):
                         message += "\n\n" + render_draft(
                             self._session.lines,
                             self._session.instructions,
                         )
-                        current_turn[-1] = AssistantMessage(content=message)
+                    current_turn[-1] = AssistantMessage(content=message)
                     self._session.transcript.append(TranscriptTurn(tuple(current_turn)))
                     return {"message": message}
                 return self._fallback(current_turn, starting_revision)
@@ -301,7 +308,7 @@ class TurnProcessor:
                 call.name in DRAFT_MUTATION_TOOL_NAMES
                 for call in response.tool_calls
             )
-            for call in response.tool_calls:
+            for call_index, call in enumerate(response.tool_calls):
                 if tool_calls >= MAX_TOOL_CALLS_PER_TURN:
                     budget_exhausted = True
                     result = _aborted_tool_result(
@@ -338,6 +345,11 @@ class TurnProcessor:
                 current_turn.append(result)
                 messages.append(result)
                 if isinstance(result.payload, SubmittedPayload):
+                    for remaining_call in response.tool_calls[call_index + 1:]:
+                        current_turn.append(_aborted_tool_result(
+                            remaining_call,
+                            "submission_completed",
+                        ))
                     current_turn.append(AssistantMessage(content=result.payload.receipt))
                     self._session.transcript.append(TranscriptTurn(tuple(current_turn)))
                     return {"message": result.payload.receipt}
@@ -361,7 +373,8 @@ class TurnProcessor:
         current_turn: list[ModelMessage],
         starting_revision: int,
     ) -> dict[str, str]:
-        self._session.invalidate_review()
+        if self._session.status == "draft":
+            self._session.invalidate_review()
         if self._session.status == "submitted" and self._session.receipt_message:
             message = self._session.receipt_message
             current_turn.append(AssistantMessage(content=message))
@@ -370,23 +383,33 @@ class TurnProcessor:
         if self._session.status == "uncertain" and isinstance(
             self._session.submission_outcome, UncertainSubmissionPayload,
         ):
-            outcome = self._session.submission_outcome
-            message = outcome.reason + " " + outcome.resolution
+            uncertain_submission = self._session.submission_outcome
+            message = uncertain_submission.reason + " " + uncertain_submission.resolution
+            current_turn.append(AssistantMessage(content=message))
+            self._session.transcript.append(TranscriptTurn(tuple(current_turn)))
+            return {"message": message}
+        if self._session.status in {"rejected", "application_error", "not_sent"} and isinstance(
+            self._session.submission_outcome,
+            (RejectedSubmissionPayload, ApplicationErrorPayload, NotSentPayload),
+        ):
+            submission_outcome = self._session.submission_outcome
+            message = submission_outcome.reason + " " + submission_outcome.resolution
             current_turn.append(AssistantMessage(content=message))
             self._session.transcript.append(TranscriptTurn(tuple(current_turn)))
             return {"message": message}
         message = SAFE_FALLBACK
         if self._session.revision != starting_revision:
+            outstanding = "\n".join(self._outstanding_questions(current_turn))
             message = (
                 "I couldn't finish that request safely, but some changes were applied.\n"
+                + (outstanding + "\n" if outstanding else "")
                 + render_draft(self._session.lines, self._session.instructions)
             )
         current_turn.append(AssistantMessage(content=message))
         self._session.transcript.append(TranscriptTurn(tuple(current_turn)))
         return {"message": message}
 
-    @staticmethod
-    def _authoritative_message(current_turn: list[ModelMessage]) -> str | None:
+    def _authoritative_message(self, current_turn: list[ModelMessage]) -> str | None:
         for message in reversed(current_turn):
             if isinstance(message, ToolResultMessage):
                 if isinstance(message.payload, ReviewedPayload):
@@ -401,6 +424,60 @@ class TurnProcessor:
                     ),
                 ):
                     return message.payload.reason + " " + message.payload.resolution
+        read_responses: list[str] = []
+        for message in current_turn:
+            if not isinstance(message, ToolResultMessage) or not isinstance(
+                message.payload, ResultPayload,
+            ):
+                continue
+            if isinstance(message.payload.result, MenuSnapshot):
+                read_responses.append(render_menu(
+                    self._menu,
+                    [item.item_id for item in message.payload.result.items],
+                ))
+            elif self._draft_result(message) is not None:
+                read_responses.append(render_draft(
+                    self._session.lines,
+                    self._session.instructions,
+                ))
+        if not read_responses:
+            return None
+        return "\n\n".join([
+            *read_responses,
+            *self._outstanding_questions(current_turn),
+        ])
+
+    @staticmethod
+    def _outstanding_questions(current_turn: list[ModelMessage]) -> list[str]:
+        questions: list[str] = []
+        for message in current_turn:
+            if not isinstance(message, ToolResultMessage) or not isinstance(
+                message.payload, Incomplete,
+            ):
+                continue
+            payload = message.payload
+            choices = (
+                " Choices: " + ", ".join(choice.label for choice in payload.alternatives) + "."
+                if payload.alternatives else ""
+            )
+            questions.append(
+                "Outstanding question: " + payload.reason + " "
+                + payload.resolution + choices
+            )
+        return questions
+
+    @staticmethod
+    def _has_draft_result(current_turn: list[ModelMessage]) -> bool:
+        return any(TurnProcessor._draft_result(message) is not None for message in current_turn)
+
+    @staticmethod
+    def _draft_result(message: ModelMessage) -> DraftSnapshot | None:
+        if (
+            isinstance(message, ToolResultMessage)
+            and isinstance(message.payload, ResultPayload)
+            and isinstance(message.payload.result, DraftSnapshot)
+        ):
+            return message.payload.result
         return None
 
     def _replay_result(
@@ -757,13 +834,18 @@ class TurnProcessor:
                 invoked=True,
                 result={"client_error": "submission_failed", "outcome": "uncertain"},
             )
+        if self._submission_observer is not None:
+            try:
+                self._submission_observer(frozen_payload, outcome)
+            except Exception:
+                pass
         reviewed_total = sum(line.total_cents for line in self._session.lines)
         if outcome.status == "rejected":
-            explanation = outcome.result.get("error", "No explanation supplied")
+            explanation = _customer_safe_rejection_explanation(outcome.result.get("error"))
             rejected = RejectedSubmissionPayload(
                 outcome="REJECTED",
                 remedy="ask_customer_before_retry",
-                reason=f"The restaurant rejected the order: {explanation}.",
+                reason="The restaurant rejected the order. " + explanation,
                 resolution=(
                     "Your selections are preserved; a later explicit customer request may "
                     "retry this exact reviewed order."
@@ -825,3 +907,18 @@ def _restaurant_total_cents(value: object) -> int | None:
     if not cents.is_finite() or cents != cents.to_integral_value():
         return None
     return int(cents)
+
+
+def _customer_safe_rejection_explanation(value: object) -> str:
+    """Map untrusted restaurant diagnostics to a small customer-safe vocabulary."""
+
+    if not isinstance(value, str):
+        return "No customer-safe explanation was provided."
+    normalized = value.casefold()
+    if "busy" in normalized or "capacity" in normalized:
+        return "The restaurant is currently busy."
+    if "closed" in normalized:
+        return "The restaurant is currently closed."
+    if "sold out" in normalized or "unavailable" in normalized:
+        return "A requested selection is currently unavailable."
+    return "No customer-safe explanation was provided."

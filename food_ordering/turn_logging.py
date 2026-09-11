@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -10,13 +11,27 @@ class TurnLogger:
         self._path = path if path is not None else Path(os.getenv("FOOD_ORDER_LOG_PATH", "logs/turns.jsonl"))
         self._secrets = tuple(value for value in [os.getenv("MISTRAL_API_KEY")] if value)
 
+    @staticmethod
+    def _sensitive_key(key: object) -> bool:
+        normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+        return any(marker in normalized for marker in (
+            "authorization", "apikey", "token", "secret", "password", "cookie", "header",
+        ))
+
     def _redact(self, value: Any) -> Any:
         if isinstance(value, str):
             for secret in self._secrets:
                 value = value.replace(secret, "[REDACTED]")
-            return value
+            return re.sub(
+                r"(?i)(bearer\s+)[^\s,;]+",
+                r"\1[REDACTED]",
+                value,
+            )
         if isinstance(value, dict):
-            return {key: self._redact(item) for key, item in value.items()}
+            return {
+                key: "[REDACTED]" if self._sensitive_key(key) else self._redact(item)
+                for key, item in value.items()
+            }
         if isinstance(value, list):
             return [self._redact(item) for item in value]
         return value
