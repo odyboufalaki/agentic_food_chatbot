@@ -54,7 +54,7 @@ def test_model_can_read_menu_result_then_complete_a_natural_response() -> None:
         "show_menu", "show_draft", "add_item", "update_item",
     ]
     update_spec = next(tool for tool in model.tool_specs[0] if tool.name == "update_item")
-    assert "ReplaceServings" not in update_spec.parameters["$defs"]
+    assert "ReplaceServings" in update_spec.parameters["$defs"]
     result = model.requests[1][-1]
     assert isinstance(result, ToolResultMessage)
     assert result.call_id == "call-1"
@@ -274,70 +274,223 @@ def test_tool_call_budget_pairs_the_over_budget_call_with_an_aborted_result() ->
     }
 
 
-def test_processor_rejects_unimplemented_replacement_and_leaves_state_unchanged() -> None:
-    line = OrderLine(
-        item_id="fries",
-        name="French Fries",
-        quantity=1,
-        options=(("size", "medium"),),
-        extras=(),
-        unit_cents=350,
-        line_id="L2",
+def test_partial_replacement_uses_clean_defaults_and_preserves_unaffected_servings() -> None:
+    original = OrderLine(
+        item_id="classic_burger",
+        name="Classic Burger",
+        quantity=2,
+        options=(("size", "large"), ("patty", "chicken")),
+        extras=("cheese",),
+        unit_cents=1150,
+        line_id="L1",
+        instructions="no onions",
     )
     session = Session(
-        lines=[line],
+        lines=[original],
         instructions="ring the bell",
-        next_line_number=3,
+        next_line_number=2,
         revision=4,
-        reviewed_revision=4,
-        status="rejected",
-        receipt_message="prior receipt text",
-        rejected_payload={"error": "kitchen busy"},
-        retry_requires_review=True,
-    )
-    authoritative_before = (
-        list(session.lines),
-        session.instructions,
-        session.next_line_number,
-        session.revision,
-        session.reviewed_revision,
-        session.status,
-        session.receipt_message,
-        session.rejected_payload,
-        session.application_error_payload,
-        session.retry_requires_review,
-        session.pending_change,
     )
     model = ScriptedModel(
         AssistantMessage(tool_calls=(ToolCall(
-            call_id="mutation-1",
+            call_id="replace-one",
             name="update_item",
             arguments={
-                "target": {"type": "line", "line_id": "L2"},
-                "change": {"type": "replace", "item_id": "onion_rings"},
+                "target": {"type": "line", "line_id": "L1"},
+                "servings": 1,
+                "change": {"type": "replace", "item_id": "fries"},
             },
         ),)),
-        AssistantMessage(content="I can't make that change in this flow."),
+        AssistantMessage(content="I replaced one burger with fries."),
     )
 
-    TurnProcessor(model=model, menu=load_menu(), session=session).process("Add a burger")
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Replace one burger with fries",
+    )
 
-    rejection = model.requests[1][-1]
-    assert isinstance(rejection, ToolResultMessage)
-    assert _payload(rejection)["outcome"] == "UNSATISFIABLE"
-    assert (
-        list(session.lines),
-        session.instructions,
-        session.next_line_number,
-        session.revision,
-        session.reviewed_revision,
-        session.status,
-        session.receipt_message,
-        session.rejected_payload,
-        session.application_error_payload,
-        session.retry_requires_review,
-        session.pending_change,
-    ) == authoritative_before
+    assert session.lines == [
+        OrderLine(
+            item_id="classic_burger", name="Classic Burger", quantity=1,
+            options=(("size", "large"), ("patty", "chicken")),
+            extras=("cheese",), unit_cents=1150, line_id="L1",
+            instructions="no onions",
+        ),
+        OrderLine(
+            item_id="fries", name="French Fries", quantity=1,
+            options=(("size", "medium"),), extras=(), unit_cents=350,
+            line_id="L2", instructions="",
+        ),
+    ]
+    assert session.instructions == "ring the bell"
+    assert session.next_line_number == 3
+    assert session.revision == 5
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    payload = _payload(result)
+    assert payload["outcome"] == "APPLIED"
+    assert payload["effect"] == {
+        "operation": "update_item",
+        "affected_line_ids": ["L1"],
+        "created_line_ids": ["L2"],
+        "removed_line_ids": [],
+    }
+    assert payload["draft"]["total_cents"] == 1500
+
+
+def test_replacement_missing_a_required_destination_option_changes_nothing() -> None:
+    originals = [
+        OrderLine(
+            item_id="classic_burger", name="Classic Burger", quantity=1,
+            options=(("size", "regular"), ("patty", "beef")), extras=(),
+            unit_cents=850, line_id="L1", instructions="",
+        ),
+        OrderLine(
+            item_id="classic_burger", name="Classic Burger", quantity=2,
+            options=(("size", "large"), ("patty", "veggie")), extras=("cheese",),
+            unit_cents=1150, line_id="L2", instructions="well done",
+        ),
+    ]
+    session = Session(lines=list(originals), next_line_number=3, revision=2)
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="missing-flavor",
+            name="update_item",
+            arguments={
+                "target": {"type": "match", "item_id": "classic_burger"},
+                "servings": "all",
+                "change": {"type": "replace", "item_id": "milkshake"},
+            },
+        ),)),
+        AssistantMessage(content="Which milkshake flavor would you like?"),
+    )
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Replace all burgers with milkshakes",
+    )
+
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    payload = _payload(result)
+    assert payload["outcome"] == "INCOMPLETE"
+    assert payload["key"] == "flavor"
+    assert [choice["value"] for choice in payload["alternatives"]] == [
+        "vanilla", "chocolate", "strawberry", "oreo",
+    ]
+    assert session.lines == originals
+    assert session.revision == 2
+    assert session.next_line_number == 3
+
+
+def test_explicit_replacement_values_span_earliest_lines_and_group_new_servings() -> None:
+    session = Session(
+        lines=[
+            OrderLine(
+                item_id="classic_burger", name="Classic Burger", quantity=1,
+                options=(("size", "regular"), ("patty", "beef")), extras=(),
+                unit_cents=850, line_id="L1", instructions="no salt",
+            ),
+            OrderLine(
+                item_id="classic_burger", name="Classic Burger", quantity=2,
+                options=(("size", "regular"), ("patty", "beef")), extras=("cheese",),
+                unit_cents=950, line_id="L2", instructions="well done",
+            ),
+        ],
+        next_line_number=3,
+        revision=2,
+    )
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="replace-earliest-two",
+            name="update_item",
+            arguments={
+                "target": {"type": "match", "item_id": "classic_burger"},
+                "servings": 2,
+                "change": {
+                    "type": "replace",
+                    "item_id": "fries",
+                    "options": {"size": "large"},
+                    "extras": ["parmesan"],
+                    "instructions": "extra crispy",
+                },
+            },
+        ),)),
+        AssistantMessage(content="I replaced the first two burgers."),
+    )
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Replace two burgers with large parmesan fries, extra crispy",
+    )
+
+    assert [
+        (
+            line.line_id, line.item_id, line.quantity, dict(line.options),
+            line.extras, line.instructions, line.unit_cents,
+        )
+        for line in session.lines
+    ] == [
+        ("L1", "fries", 1, {"size": "large"}, ("parmesan",), "extra crispy", 600),
+        (
+            "L2", "classic_burger", 1,
+            {"size": "regular", "patty": "beef"},
+            ("cheese",), "well done", 950,
+        ),
+        ("L3", "fries", 1, {"size": "large"}, ("parmesan",), "extra crispy", 600),
+    ]
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    payload = _payload(result)
+    assert payload["effect"]["affected_line_ids"] == ["L1", "L2"]
+    assert payload["effect"]["created_line_ids"] == ["L3"]
+    assert payload["draft"]["total_cents"] == 2150
+    assert [
+        (group["line_ids"], group["quantity"], group["total_cents"])
+        for group in payload["draft"]["display_groups"]
+    ] == [(["L1", "L3"], 2, 1200), (["L2"], 1, 950)]
+
+
+@pytest.mark.parametrize(
+    ("change", "expected_key"),
+    [
+        ({"options": {"temperature": "hot"}}, "temperature"),
+        ({"options": {"size": "family"}}, "size"),
+        ({"extras": ["cheese"]}, "extras"),
+    ],
+)
+def test_invalid_destination_values_leave_replacement_unapplied(
+    change: dict[str, Any],
+    expected_key: str,
+) -> None:
+    original = OrderLine(
+        item_id="classic_burger", name="Classic Burger", quantity=2,
+        options=(("size", "large"), ("patty", "chicken")), extras=("cheese",),
+        unit_cents=1150, line_id="L1", instructions="no onions",
+    )
+    session = Session(lines=[original], next_line_number=2, revision=1)
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="invalid-destination",
+            name="update_item",
+            arguments={
+                "target": {"type": "line", "line_id": "L1"},
+                "servings": 1,
+                "change": {"type": "replace", "item_id": "fries", **change},
+            },
+        ),)),
+        AssistantMessage(content="That replacement is unavailable."),
+    )
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Replace one burger using an unavailable fries configuration",
+    )
+
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    payload = _payload(result)
+    assert payload["outcome"] == "UNSATISFIABLE"
+    assert payload["key"] == expected_key
+    assert session.lines == [original]
+    assert session.revision == 1
+    assert session.next_line_number == 2
 
 
 def test_complete_tool_pairs_are_retained_by_turn_for_later_reconstruction() -> None:

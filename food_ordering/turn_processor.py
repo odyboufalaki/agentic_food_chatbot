@@ -1,6 +1,10 @@
 """Bounded, provider-neutral orchestration for one customer turn."""
 
-from food_ordering.draft_operations import validate_add_item, validate_customize_item
+from food_ordering.draft_operations import (
+    validate_add_item,
+    validate_customize_item,
+    validate_replace_item,
+)
 from food_ordering.menu import Menu
 from food_ordering.model_adapter import (
     AbortReason,
@@ -22,7 +26,6 @@ from food_ordering.tool_protocol import (
     AppliedEffect,
     AppliedPayload,
     CartInvalid,
-    CustomizeServings,
     DisplayGroupSnapshot,
     DraftSnapshot,
     DraftState,
@@ -54,18 +57,13 @@ SAFE_FALLBACK = (
 )
 
 
-class _CustomizationUpdateItem(UpdateItem):
-    change: CustomizeServings
-
-
 def _tool_specs() -> tuple[ToolSpec, ...]:
     schemas = protocol_schema()["tools"]
-    schemas["update_item"] = _CustomizationUpdateItem.model_json_schema()
     descriptions = {
         "show_menu": "Return the complete Menu or the requested menu items.",
         "show_draft": "Return the complete authoritative Draft order.",
         "add_item": "Add one configured menu item to the Draft order.",
-        "update_item": "Customize selected servings in the Draft order.",
+        "update_item": "Customize or replace selected servings in the Draft order.",
     }
     return tuple(
         ToolSpec(name=name, parameters=schemas[name], description=description)
@@ -366,18 +364,10 @@ class TurnProcessor:
                     self._menu,
                 )
             else:
-                if operation.change.type != "customize":
-                    return ToolResultMessage(call.call_id, call.name, Unsatisfiable(
-                        outcome="UNSATISFIABLE",
-                        remedy="change_request",
-                        reason="Replacement is unavailable in this processor version.",
-                        resolution="Customize the existing item instead.",
-                        subject=call.name,
-                    ))
-                validation = validate_customize_item(
-                    operation,
-                    draft,
-                    self._menu,
+                validation = (
+                    validate_customize_item(operation, draft, self._menu)
+                    if operation.change.type == "customize"
+                    else validate_replace_item(operation, draft, self._menu)
                 )
             if not isinstance(validation, Valid):
                 return ToolResultMessage(call.call_id, call.name, validation)

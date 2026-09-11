@@ -1,5 +1,6 @@
 """Pure validators for typed Draft order operations."""
 
+from collections.abc import Callable
 from dataclasses import replace
 from typing import assert_never
 
@@ -23,6 +24,7 @@ from food_ordering.tool_protocol import (
     DraftState,
     Incomplete,
     OperationEffect,
+    ReplaceServings,
     Unsatisfiable,
     UpdateItem,
     ValidationOutcome,
@@ -145,14 +147,12 @@ def _matching_lines(operation: UpdateItem, draft: DraftState) -> list[OrderLine]
     ]
 
 
-def validate_customize_item(
+def _validate_selected_servings(
     operation: UpdateItem,
     draft: DraftState,
-    menu: Menu,
-) -> ValidationOutcome:
-    """Validate deterministic serving customization without mutating Session."""
-
-    assert isinstance(operation.change, CustomizeServings)
+    *,
+    action: str,
+) -> tuple[list[OrderLine], int] | Incomplete | Unsatisfiable:
     matches = _matching_lines(operation, draft)
     if not matches:
         return Unsatisfiable(
@@ -167,7 +167,7 @@ def validate_customize_item(
             outcome="INCOMPLETE",
             remedy="ask_customer",
             reason="More than one Order line matches that target.",
-            resolution="Ask the customer to identify which matching Order line to customize.",
+            resolution=f"Ask the customer to identify which matching Order line to {action}.",
             subject=matches[0].name,
             key="target",
             alternatives=[
@@ -198,7 +198,74 @@ def validate_customize_item(
             key="servings",
             constraint=ValueConstraint(minimum=1, maximum=available),
         )
+    return matches, selected
+
+
+def _apply_to_selected_servings(
+    draft: DraftState,
+    selection: tuple[list[OrderLine], int],
+    transform: Callable[[OrderLine, int], OrderLine | Incomplete | Unsatisfiable],
+) -> ValidationOutcome:
+    matches, selected = selection
+    remaining = selected
+    candidate = list(draft.lines)
+    next_line_number = draft.next_line_number
+    affected_line_ids: list[str] = []
+    created_line_ids: list[str] = []
+    changed = False
+    for line in matches:
+        if remaining == 0:
+            break
+        quantity = min(remaining, line.quantity)
+        normalized = transform(line, quantity)
+        if not isinstance(normalized, OrderLine):
+            return normalized
+        line_changed = normalized != replace(line, quantity=quantity)
+        index = candidate.index(line)
+        if quantity < line.quantity and line_changed:
+            new_line_id = f"L{next_line_number}"
+            next_line_number += 1
+            normalized = replace(normalized, line_id=new_line_id)
+            candidate[index:index + 1] = [
+                replace(line, quantity=line.quantity - quantity),
+                normalized,
+            ]
+            affected_line_ids.append(line.line_id)
+            created_line_ids.append(new_line_id)
+        elif line_changed:
+            candidate[index] = normalized
+            affected_line_ids.append(line.line_id)
+        changed = changed or line_changed
+        remaining -= quantity
+
+    return Valid(
+        candidate=DraftState(
+            lines=tuple(candidate),
+            general_instructions=draft.general_instructions,
+            next_line_number=next_line_number,
+        ),
+        effect=OperationEffect(
+            operation="update_item",
+            affected_line_ids=tuple(affected_line_ids),
+            created_line_ids=tuple(created_line_ids),
+        ),
+        changed=changed,
+    )
+
+
+def validate_customize_item(
+    operation: UpdateItem,
+    draft: DraftState,
+    menu: Menu,
+) -> ValidationOutcome:
+    """Validate deterministic serving customization without mutating Session."""
+
+    assert isinstance(operation.change, CustomizeServings)
+    selection = _validate_selected_servings(operation, draft, action="customize")
+    if not isinstance(selection, tuple):
+        return selection
     change = operation.change
+    matches, _ = selection
     overlapping_extras = set(change.add_extras) & set(change.remove_extras)
     if overlapping_extras:
         extra = sorted(overlapping_extras)[0]
@@ -211,16 +278,10 @@ def validate_customize_item(
             key="extras",
         )
 
-    remaining = selected
-    candidate = list(draft.lines)
-    next_line_number = draft.next_line_number
-    affected_line_ids: list[str] = []
-    created_line_ids: list[str] = []
-    changed = False
-    for line in matches:
-        if remaining == 0:
-            break
-        quantity = min(remaining, line.quantity)
+    def customize(
+        line: OrderLine,
+        quantity: int,
+    ) -> OrderLine | Incomplete | Unsatisfiable:
         missing_extra = next(
             (extra for extra in change.remove_extras if extra not in line.extras),
             None,
@@ -255,34 +316,62 @@ def validate_customize_item(
         )
         if not isinstance(normalized, OrderLine):
             return _selection_issue_outcome(normalized, menu)
-        line_changed = normalized != replace(line, quantity=quantity)
-        index = candidate.index(line)
-        if quantity < line.quantity and line_changed:
-            new_line_id = f"L{next_line_number}"
-            next_line_number += 1
-            normalized = replace(normalized, line_id=new_line_id)
-            candidate[index:index + 1] = [
-                replace(line, quantity=line.quantity - quantity),
-                normalized,
-            ]
-            affected_line_ids.append(line.line_id)
-            created_line_ids.append(new_line_id)
-        elif line_changed:
-            candidate[index] = normalized
-            affected_line_ids.append(line.line_id)
-        changed = changed or line_changed
-        remaining -= quantity
+        return normalized
 
-    return Valid(
-        candidate=DraftState(
-            lines=tuple(candidate),
-            general_instructions=draft.general_instructions,
-            next_line_number=next_line_number,
-        ),
-        effect=OperationEffect(
-            operation="update_item",
-            affected_line_ids=tuple(affected_line_ids),
-            created_line_ids=tuple(created_line_ids),
-        ),
-        changed=changed,
-    )
+    return _apply_to_selected_servings(draft, selection, customize)
+
+
+def _replacement_issue_outcome(
+    issue: AddSelectionIssue,
+    menu: Menu,
+) -> Incomplete | Unsatisfiable:
+    if isinstance(issue, UnsupportedOptionValue):
+        return Unsatisfiable(
+            outcome="UNSATISFIABLE",
+            remedy="change_request",
+            reason=(
+                f"{issue.value} is not a supported {issue.key} for {issue.item_name}."
+            ),
+            resolution=f"Choose a supported {issue.key} for {issue.item_name}.",
+            subject=issue.item_name,
+            key=issue.key,
+            alternatives=_alternatives([
+                (choice, choice) for choice in issue.alternatives
+            ]),
+        )
+    return _selection_issue_outcome(issue, menu)
+
+
+def validate_replace_item(
+    operation: UpdateItem,
+    draft: DraftState,
+    menu: Menu,
+) -> ValidationOutcome:
+    """Validate deterministic product replacement without mutating Session."""
+
+    assert isinstance(operation.change, ReplaceServings)
+    selection = _validate_selected_servings(operation, draft, action="replace")
+    if not isinstance(selection, tuple):
+        return selection
+    change = operation.change
+
+    def replace_serving(
+        line: OrderLine,
+        quantity: int,
+    ) -> OrderLine | Incomplete | Unsatisfiable:
+        normalized = normalize_add_selection(
+            AddItem(
+                item_id=change.item_id,
+                quantity=quantity,
+                options=change.options,
+                extras=change.extras,
+                instructions=change.instructions,
+            ),
+            menu,
+            line_id=line.line_id,
+        )
+        if not isinstance(normalized, OrderLine):
+            return _replacement_issue_outcome(normalized, menu)
+        return normalized
+
+    return _apply_to_selected_servings(draft, selection, replace_serving)
