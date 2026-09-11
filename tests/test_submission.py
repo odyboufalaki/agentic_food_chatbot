@@ -109,6 +109,40 @@ def test_review_then_confirmation_submits_once_and_returns_receipt(tmp_path):
     assert transport.closed == 1
 
 
+def test_redundant_review_with_confirmation_submits_an_unchanged_reviewed_order(tmp_path):
+    transport = RestaurantTransport()
+    agent = restaurant_agent(
+        tmp_path,
+        transport,
+        {"operations": [add("burger")]},
+        {"operations": [{"type": "review"}]},
+        {"operations": [{"type": "review"}, {"type": "confirm"}]},
+    )
+    agent.send("A burger")
+    agent.send("That's it")
+
+    response = agent.send("Yes")
+
+    assert "Order accepted and submitted!" in response["message"]
+    assert len(transport.calls) == 1
+
+
+def test_review_with_confirmation_cannot_bypass_the_initial_review(tmp_path):
+    transport = RestaurantTransport()
+    agent = restaurant_agent(
+        tmp_path,
+        transport,
+        {"operations": [add("burger")]},
+        {"operations": [{"type": "review"}, {"type": "confirm"}]},
+    )
+    agent.send("A burger")
+
+    response = agent.send("Submit and confirm")
+
+    assert "Please confirm: submit this exact order?" in response["message"]
+    assert transport.calls == []
+
+
 def test_accepted_order_requires_explicit_new_order_before_adding_food(tmp_path):
     transport = RestaurantTransport()
     agent = restaurant_agent(tmp_path, transport,

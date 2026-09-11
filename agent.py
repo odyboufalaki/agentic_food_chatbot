@@ -274,7 +274,8 @@ class FoodOrderAgent:
                     payload = self._rejected_payload if self._status == "rejected" else submission_payload(self._lines, self._menu, self._instructions)
                     if payload is None:
                         raise InvalidSelection("There is no rejected submission available to retry.")
-                    if self._status == "draft" and (retry_requested or review_requested or changed
+                    if self._status == "draft" and (retry_requested
+                                                    or (review_requested and not submit_requested) or changed
                                                     or self._reviewed_revision != self._revision):
                         self._reviewed_revision = self._revision
                         response["message"] = render_draft(self._lines, self._instructions) + "\nPlease confirm: submit this exact order?"
