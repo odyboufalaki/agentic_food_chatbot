@@ -1,9 +1,11 @@
 """Pure validators for typed Draft order operations."""
 
 from dataclasses import replace
+from typing import assert_never
 
 from food_ordering.menu import ALIASES, Menu
 from food_ordering.order import (
+    AddSelectionIssue,
     MissingRequiredOption,
     OrderLine,
     UnsupportedExtra,
@@ -36,6 +38,76 @@ def _alternatives(values: list[tuple[str, str]]) -> list[Alternative]:
     ]
 
 
+def _selection_issue_outcome(
+    issue: AddSelectionIssue,
+    menu: Menu,
+) -> Incomplete | Unsatisfiable:
+    if isinstance(issue, UnsupportedItem):
+        return Unsatisfiable(
+            outcome="UNSATISFIABLE",
+            remedy="change_request",
+            reason="The requested item is not on the Menu.",
+            resolution="Choose an item listed in the Menu.",
+            subject=issue.item_id,
+            key="item_id",
+            alternatives=_alternatives([
+                (candidate.id, candidate.name) for candidate in menu.menu
+            ]),
+        )
+    if isinstance(issue, UnsupportedOption):
+        return Unsatisfiable(
+            outcome="UNSATISFIABLE",
+            remedy="change_request",
+            reason=f"{issue.item_name} does not support the {issue.key} option.",
+            resolution=f"Choose a supported option for {issue.item_name}.",
+            subject=issue.item_name,
+            key=issue.key,
+            alternatives=_alternatives([(name, name) for name in issue.alternatives]),
+        )
+    if isinstance(issue, (MissingRequiredOption, UnsupportedOptionValue)):
+        return Incomplete(
+            outcome="INCOMPLETE",
+            remedy="ask_customer",
+            reason=(
+                f"{issue.item_name} requires a {issue.key}."
+                if isinstance(issue, MissingRequiredOption)
+                else f"{issue.value} is not a supported {issue.key} for {issue.item_name}."
+            ),
+            resolution=(
+                f"Ask the customer to choose a {issue.key}."
+                if isinstance(issue, MissingRequiredOption)
+                else f"Ask the customer to choose a supported {issue.key}."
+            ),
+            subject=issue.item_name,
+            key=issue.key,
+            alternatives=_alternatives([
+                (choice, choice) for choice in issue.alternatives
+            ]),
+        )
+    if isinstance(issue, UnsupportedExtra):
+        return Unsatisfiable(
+            outcome="UNSATISFIABLE",
+            remedy="change_request",
+            reason=f"{issue.item_name} does not support the {issue.value} extra.",
+            resolution=f"Choose a supported extra for {issue.item_name}.",
+            subject=issue.item_name,
+            key="extras",
+            alternatives=_alternatives([(extra, extra) for extra in issue.alternatives]),
+        )
+    if isinstance(issue, UnsupportedInstructionAddition):
+        return Unsatisfiable(
+            outcome="UNSATISFIABLE",
+            remedy="change_request",
+            reason="An addition cannot be added through Special instructions.",
+            resolution="Select the Extra explicitly when it is supported by the item.",
+            subject=issue.item_name,
+            key="instructions",
+            alternatives=_alternatives([(extra, extra) for extra in issue.alternatives]),
+            note=f"Instruction requested the unselected addition {issue.value}.",
+        )
+    assert_never(issue)
+
+
 def validate_add_item(
     operation: AddItem,
     draft: DraftState,
@@ -45,79 +117,8 @@ def validate_add_item(
 
     line_id = f"L{draft.next_line_number}"
     normalized = normalize_add_selection(operation, menu, line_id=line_id)
-    if isinstance(normalized, UnsupportedItem):
-        return Unsatisfiable(
-            outcome="UNSATISFIABLE",
-            remedy="change_request",
-            reason="The requested item is not on the Menu.",
-            resolution="Choose an item listed in the Menu.",
-            subject=operation.item_id,
-            key="item_id",
-            alternatives=_alternatives([
-                (candidate.id, candidate.name) for candidate in menu.menu
-            ]),
-        )
-    if isinstance(normalized, UnsupportedOption):
-        return Unsatisfiable(
-            outcome="UNSATISFIABLE",
-            remedy="change_request",
-            reason=f"{normalized.item_name} does not support the {normalized.key} option.",
-            resolution=f"Choose a supported option for {normalized.item_name}.",
-            subject=normalized.item_name,
-            key=normalized.key,
-            alternatives=_alternatives([(name, name) for name in normalized.alternatives]),
-        )
-    if isinstance(normalized, (MissingRequiredOption, UnsupportedOptionValue)):
-        reason = (
-            f"{normalized.item_name} requires a {normalized.key}."
-            if isinstance(normalized, MissingRequiredOption)
-            else (
-                f"{normalized.value} is not a supported {normalized.key} "
-                f"for {normalized.item_name}."
-            )
-        )
-        return Incomplete(
-            outcome="INCOMPLETE",
-            remedy="ask_customer",
-            reason=reason,
-            resolution=(
-                f"Ask the customer to choose a {normalized.key}."
-                if isinstance(normalized, MissingRequiredOption)
-                else f"Ask the customer to choose a supported {normalized.key}."
-            ),
-            subject=normalized.item_name,
-            key=normalized.key,
-            alternatives=_alternatives([
-                (choice, choice) for choice in normalized.alternatives
-            ]),
-        )
-    if isinstance(normalized, UnsupportedExtra):
-        return Unsatisfiable(
-            outcome="UNSATISFIABLE",
-            remedy="change_request",
-            reason=f"{normalized.item_name} does not support the {normalized.value} extra.",
-            resolution=f"Choose a supported extra for {normalized.item_name}.",
-            subject=normalized.item_name,
-            key="extras",
-            alternatives=_alternatives([
-                (extra, extra) for extra in normalized.alternatives
-            ]),
-        )
-
-    if isinstance(normalized, UnsupportedInstructionAddition):
-        return Unsatisfiable(
-            outcome="UNSATISFIABLE",
-            remedy="change_request",
-            reason="An addition cannot be added through Special instructions.",
-            resolution="Select the Extra explicitly when it is supported by the item.",
-            subject=normalized.item_name,
-            key="instructions",
-            alternatives=_alternatives([
-                (extra, extra) for extra in normalized.alternatives
-            ]),
-            note=f"Instruction requested the unselected addition {normalized.value}.",
-        )
-    assert isinstance(normalized, OrderLine)
+    if not isinstance(normalized, OrderLine):
+        return _selection_issue_outcome(normalized, menu)
     return Valid(
         candidate=DraftState(
             lines=(*draft.lines, normalized),
@@ -252,79 +253,8 @@ def validate_customize_item(
             menu,
             line_id=line.line_id,
         )
-        if isinstance(normalized, UnsupportedItem):
-            return Unsatisfiable(
-                outcome="UNSATISFIABLE",
-                remedy="change_request",
-                reason="The targeted item is no longer on the Menu.",
-                resolution="Choose an item listed in the Menu.",
-                subject=normalized.item_id,
-                key="item_id",
-                alternatives=_alternatives([
-                    (candidate.id, candidate.name) for candidate in menu.menu
-                ]),
-            )
-        if isinstance(normalized, UnsupportedOption):
-            return Unsatisfiable(
-                outcome="UNSATISFIABLE",
-                remedy="change_request",
-                reason=(
-                    f"{normalized.item_name} does not support the {normalized.key} option."
-                ),
-                resolution=f"Choose a supported option for {normalized.item_name}.",
-                subject=normalized.item_name,
-                key=normalized.key,
-                alternatives=_alternatives([
-                    (name, name) for name in normalized.alternatives
-                ]),
-            )
-        if isinstance(normalized, (MissingRequiredOption, UnsupportedOptionValue)):
-            return Incomplete(
-                outcome="INCOMPLETE",
-                remedy="ask_customer",
-                reason=(
-                    f"{normalized.item_name} requires a {normalized.key}."
-                    if isinstance(normalized, MissingRequiredOption)
-                    else (
-                        f"{normalized.value} is not a supported {normalized.key} "
-                        f"for {normalized.item_name}."
-                    )
-                ),
-                resolution=f"Ask the customer to choose a supported {normalized.key}.",
-                subject=normalized.item_name,
-                key=normalized.key,
-                alternatives=_alternatives([
-                    (value, value) for value in normalized.alternatives
-                ]),
-            )
-        if isinstance(normalized, UnsupportedExtra):
-            return Unsatisfiable(
-                outcome="UNSATISFIABLE",
-                remedy="change_request",
-                reason=(
-                    f"{normalized.item_name} does not support the {normalized.value} extra."
-                ),
-                resolution=f"Choose a supported extra for {normalized.item_name}.",
-                subject=normalized.item_name,
-                key="extras",
-                alternatives=_alternatives([
-                    (extra, extra) for extra in normalized.alternatives
-                ]),
-            )
-        if isinstance(normalized, UnsupportedInstructionAddition):
-            return Unsatisfiable(
-                outcome="UNSATISFIABLE",
-                remedy="change_request",
-                reason="An addition cannot be added through Special instructions.",
-                resolution="Select the Extra explicitly when it is supported by the item.",
-                subject=normalized.item_name,
-                key="instructions",
-                alternatives=_alternatives([
-                    (extra, extra) for extra in normalized.alternatives
-                ]),
-                note=f"Instruction requested the unselected addition {normalized.value}.",
-            )
-        assert isinstance(normalized, OrderLine)
+        if not isinstance(normalized, OrderLine):
+            return _selection_issue_outcome(normalized, menu)
         line_changed = normalized != replace(line, quantity=quantity)
         index = candidate.index(line)
         if quantity < line.quantity and line_changed:

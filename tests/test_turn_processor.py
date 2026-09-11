@@ -53,6 +53,8 @@ def test_model_can_read_menu_result_then_complete_a_natural_response() -> None:
     assert [tool.name for tool in model.tool_specs[0]] == [
         "show_menu", "show_draft", "add_item", "update_item",
     ]
+    update_spec = next(tool for tool in model.tool_specs[0] if tool.name == "update_item")
+    assert "ReplaceServings" not in update_spec.parameters["$defs"]
     result = model.requests[1][-1]
     assert isinstance(result, ToolResultMessage)
     assert result.call_id == "call-1"
@@ -958,18 +960,18 @@ def test_menu_extra_cannot_bypass_validation_through_item_instructions() -> None
 def test_customizing_one_of_three_burgers_splits_the_selected_serving() -> None:
     model = ScriptedModel(
         AssistantMessage(tool_calls=(ToolCall(
-            call_id="one-chicken-burger",
+            call_id="one-large-burger",
             name="update_item",
             arguments={
                 "target": {"type": "match", "item_id": "classic_burger"},
                 "servings": 1,
                 "change": {
                     "type": "customize",
-                    "options": {"patty": "chicken"},
+                    "options": {"size": "large"},
                 },
             },
         ),)),
-        AssistantMessage(content="I made one burger chicken."),
+        AssistantMessage(content="I made one burger large."),
     )
     session = Session(
         lines=[OrderLine(
@@ -987,7 +989,7 @@ def test_customizing_one_of_three_burgers_splits_the_selected_serving() -> None:
     )
 
     TurnProcessor(model=model, menu=load_menu(), session=session).process(
-        "Make one burger chicken",
+        "Make one burger large",
     )
 
     assert [
@@ -995,7 +997,7 @@ def test_customizing_one_of_three_burgers_splits_the_selected_serving() -> None:
         for line in session.lines
     ] == [
         ("L1", 2, {"size": "regular", "patty": "beef"}, 850),
-        ("L2", 1, {"size": "regular", "patty": "chicken"}, 850),
+        ("L2", 1, {"size": "large", "patty": "beef"}, 1050),
     ]
     assert sum(line.quantity for line in session.lines) == 3
     assert session.next_line_number == 3
@@ -1051,18 +1053,18 @@ def test_ambiguous_milkshake_customization_returns_matching_lines_unchanged() ->
     assert session.next_line_number == 3
 
 
-def test_explicit_servings_customize_earliest_matching_lines_first() -> None:
+def test_one_serving_customizes_only_the_earliest_of_multiple_matching_lines() -> None:
     model = ScriptedModel(
         AssistantMessage(tool_calls=(ToolCall(
             call_id="earliest-burgers",
             name="update_item",
             arguments={
                 "target": {"type": "match", "item_id": "classic_burger"},
-                "servings": 2,
+                "servings": 1,
                 "change": {"type": "customize", "add_extras": ["cheese"]},
             },
         ),)),
-        AssistantMessage(content="I added cheese to the first two burgers."),
+        AssistantMessage(content="I added cheese to the first burger."),
     )
     session = Session(
         lines=[
@@ -1082,7 +1084,7 @@ def test_explicit_servings_customize_earliest_matching_lines_first() -> None:
     )
 
     TurnProcessor(model=model, menu=load_menu(), session=session).process(
-        "Add cheese to two burgers",
+        "Add cheese to one burger",
     )
 
     assert [
@@ -1090,11 +1092,10 @@ def test_explicit_servings_customize_earliest_matching_lines_first() -> None:
         for line in session.lines
     ] == [
         ("L1", 1, ("cheese",), 950),
-        ("L2", 1, (), 850),
-        ("L3", 1, ("cheese",), 950),
+        ("L2", 2, (), 850),
     ]
     assert session.revision == 3
-    assert session.next_line_number == 4
+    assert session.next_line_number == 3
 
 
 def test_customization_rejects_more_servings_than_match_without_mutation() -> None:

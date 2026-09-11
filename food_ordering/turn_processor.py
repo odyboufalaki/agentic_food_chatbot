@@ -1,5 +1,7 @@
 """Bounded, provider-neutral orchestration for one customer turn."""
 
+from copy import deepcopy
+
 from food_ordering.draft_operations import validate_add_item, validate_customize_item
 from food_ordering.menu import Menu
 from food_ordering.model_adapter import (
@@ -55,6 +57,15 @@ SAFE_FALLBACK = (
 
 def _tool_specs() -> tuple[ToolSpec, ...]:
     schemas = protocol_schema()["tools"]
+    update_schema = deepcopy(schemas["update_item"])
+    del update_schema["$defs"]["ReplaceServings"]
+    update_schema["properties"]["change"]["discriminator"]["mapping"] = {
+        "customize": "#/$defs/CustomizeServings",
+    }
+    update_schema["properties"]["change"]["oneOf"] = [
+        {"$ref": "#/$defs/CustomizeServings"},
+    ]
+    schemas["update_item"] = update_schema
     descriptions = {
         "show_menu": "Return the complete Menu or the requested menu items.",
         "show_draft": "Return the complete authoritative Draft order.",
