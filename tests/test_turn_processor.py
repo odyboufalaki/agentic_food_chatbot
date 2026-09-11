@@ -51,7 +51,14 @@ def test_model_can_read_menu_result_then_complete_a_natural_response() -> None:
 
     assert response == {"message": "We have burgers, pizza, sides, drinks, and desserts."}
     assert [tool.name for tool in model.tool_specs[0]] == [
-        "show_menu", "show_draft", "add_item", "update_item",
+        "show_menu",
+        "show_draft",
+        "add_item",
+        "update_item",
+        "change_quantity",
+        "remove_item",
+        "clear_draft",
+        "set_order_instructions",
     ]
     update_spec = next(tool for tool in model.tool_specs[0] if tool.name == "update_item")
     assert "ReplaceServings" in update_spec.parameters["$defs"]
@@ -677,7 +684,14 @@ def test_valid_burgers_commit_while_incomplete_milkshake_asks_for_flavor() -> No
         "Total: $17.00"
     )}
     assert [tool.name for tool in model.tool_specs[0]] == [
-        "show_menu", "show_draft", "add_item", "update_item",
+        "show_menu",
+        "show_draft",
+        "add_item",
+        "update_item",
+        "change_quantity",
+        "remove_item",
+        "clear_draft",
+        "set_order_instructions",
     ]
     results = model.requests[1][-2:]
     assert all(isinstance(result, ToolResultMessage) for result in results)

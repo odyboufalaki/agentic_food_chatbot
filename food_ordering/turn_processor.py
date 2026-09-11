@@ -2,8 +2,12 @@
 
 from food_ordering.draft_operations import (
     validate_add_item,
+    validate_change_quantity,
+    validate_clear_draft,
     validate_customize_item,
+    validate_remove_item,
     validate_replace_item,
+    validate_set_order_instructions,
 )
 from food_ordering.menu import Menu
 from food_ordering.model_adapter import (
@@ -26,6 +30,8 @@ from food_ordering.tool_protocol import (
     AppliedEffect,
     AppliedPayload,
     CartInvalid,
+    ChangeQuantity,
+    ClearDraft,
     DisplayGroupSnapshot,
     DraftSnapshot,
     DraftState,
@@ -38,7 +44,9 @@ from food_ordering.tool_protocol import (
     Malformed,
     ModelResult,
     ResultPayload,
+    RemoveItem,
     SchemaIssue,
+    SetOrderInstructions,
     ShowDraft,
     ShowMenu,
     StoredLineSnapshot,
@@ -64,6 +72,10 @@ def _tool_specs() -> tuple[ToolSpec, ...]:
         "show_draft": "Return the complete authoritative Draft order.",
         "add_item": "Add one configured menu item to the Draft order.",
         "update_item": "Customize or replace selected servings in the Draft order.",
+        "change_quantity": "Set, increase, or remove a selection's total quantity.",
+        "remove_item": "Remove one uniquely identified selection from the Draft order.",
+        "clear_draft": "Clear all selections and general instructions from the Draft order.",
+        "set_order_instructions": "Set, replace, or clear general Draft-order instructions.",
     }
     return tuple(
         ToolSpec(name=name, parameters=schemas[name], description=description)
@@ -351,7 +363,17 @@ class TurnProcessor:
                 result=_draft_snapshot(self._session),
             )
             return ToolResultMessage(call.call_id, call.name, payload)
-        if isinstance(operation, (AddItem, UpdateItem)):
+        if isinstance(
+            operation,
+            (
+                AddItem,
+                UpdateItem,
+                ChangeQuantity,
+                RemoveItem,
+                ClearDraft,
+                SetOrderInstructions,
+            ),
+        ):
             draft = DraftState(
                 lines=tuple(self._session.lines),
                 general_instructions=self._session.instructions,
@@ -363,12 +385,20 @@ class TurnProcessor:
                     draft,
                     self._menu,
                 )
-            else:
+            elif isinstance(operation, UpdateItem):
                 validation = (
                     validate_customize_item(operation, draft, self._menu)
                     if operation.change.type == "customize"
                     else validate_replace_item(operation, draft, self._menu)
                 )
+            elif isinstance(operation, ChangeQuantity):
+                validation = validate_change_quantity(operation, draft)
+            elif isinstance(operation, RemoveItem):
+                validation = validate_remove_item(operation, draft)
+            elif isinstance(operation, ClearDraft):
+                validation = validate_clear_draft(operation, draft)
+            else:
+                validation = validate_set_order_instructions(operation, draft)
             if not isinstance(validation, Valid):
                 return ToolResultMessage(call.call_id, call.name, validation)
             if not validation.changed:

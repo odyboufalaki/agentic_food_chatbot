@@ -20,10 +20,14 @@ from food_ordering.order import (
 from food_ordering.tool_protocol import (
     AddItem,
     Alternative,
+    ChangeQuantity,
+    ClearDraft,
     CustomizeServings,
     DraftState,
     Incomplete,
     OperationEffect,
+    RemoveItem,
+    SetOrderInstructions,
     ReplaceServings,
     Unsatisfiable,
     UpdateItem,
@@ -132,7 +136,131 @@ def validate_add_item(
     )
 
 
-def _matching_lines(operation: UpdateItem, draft: DraftState) -> list[OrderLine]:
+def validate_change_quantity(
+    operation: ChangeQuantity,
+    draft: DraftState,
+) -> ValidationOutcome:
+    """Validate a total quantity change without treating it as customization."""
+
+    matches = _matching_lines(operation, draft)
+    if not matches:
+        return _missing_target()
+    if len(matches) > 1:
+        return _ambiguous_target(matches, action="change the quantity of")
+    line = matches[0]
+    candidate = list(draft.lines)
+    if operation.mode == "remove" and operation.quantity > line.quantity:
+        return Incomplete(
+            outcome="INCOMPLETE",
+            remedy="ask_customer",
+            reason=f"Only {line.quantity} servings are selected on that Order line.",
+            resolution=(
+                f"Ask the customer to choose from 1 to {line.quantity} servings to remove."
+            ),
+            subject=line.name,
+            key="quantity",
+            constraint=ValueConstraint(minimum=1, maximum=line.quantity),
+        )
+    quantity = {
+        "set": operation.quantity,
+        "increase": line.quantity + operation.quantity,
+        "remove": line.quantity - operation.quantity,
+    }[operation.mode]
+    if quantity == 0:
+        candidate.remove(line)
+        affected_line_ids: tuple[str, ...] = ()
+        removed_line_ids: tuple[str, ...] = (line.line_id,)
+    else:
+        updated = replace(line, quantity=quantity)
+        candidate[candidate.index(line)] = updated
+        affected_line_ids = (line.line_id,)
+        removed_line_ids = ()
+    return Valid(
+        candidate=DraftState(
+            lines=tuple(candidate),
+            general_instructions=draft.general_instructions,
+            next_line_number=draft.next_line_number,
+        ),
+        effect=OperationEffect(
+            operation="change_quantity",
+            affected_line_ids=affected_line_ids,
+            removed_line_ids=removed_line_ids,
+        ),
+        changed=quantity != line.quantity,
+    )
+
+
+def validate_remove_item(
+    operation: RemoveItem,
+    draft: DraftState,
+) -> ValidationOutcome:
+    """Validate removal of one uniquely targeted Order line."""
+
+    matches = _matching_lines(operation, draft)
+    if not matches:
+        return _missing_target()
+    if len(matches) > 1:
+        return _ambiguous_target(matches, action="remove")
+    line = matches[0]
+    candidate = list(draft.lines)
+    candidate.remove(line)
+    return Valid(
+        candidate=DraftState(
+            lines=tuple(candidate),
+            general_instructions=draft.general_instructions,
+            next_line_number=draft.next_line_number,
+        ),
+        effect=OperationEffect(
+            operation="remove_item",
+            removed_line_ids=(line.line_id,),
+        ),
+        changed=True,
+    )
+
+
+def validate_clear_draft(
+    operation: ClearDraft,
+    draft: DraftState,
+) -> ValidationOutcome:
+    """Validate explicitly clearing every Draft-order field."""
+
+    del operation
+    return Valid(
+        candidate=DraftState(
+            lines=(),
+            general_instructions="",
+            next_line_number=draft.next_line_number,
+        ),
+        effect=OperationEffect(
+            operation="clear_draft",
+            removed_line_ids=tuple(line.line_id for line in draft.lines),
+        ),
+        changed=bool(draft.lines or draft.general_instructions),
+    )
+
+
+def validate_set_order_instructions(
+    operation: SetOrderInstructions,
+    draft: DraftState,
+) -> ValidationOutcome:
+    """Validate replacement of general instructions independently of item notes."""
+
+    instructions = operation.instructions.strip()
+    return Valid(
+        candidate=DraftState(
+            lines=draft.lines,
+            general_instructions=instructions,
+            next_line_number=draft.next_line_number,
+        ),
+        effect=OperationEffect(operation="set_order_instructions"),
+        changed=instructions != draft.general_instructions,
+    )
+
+
+def _matching_lines(
+    operation: UpdateItem | ChangeQuantity | RemoveItem,
+    draft: DraftState,
+) -> list[OrderLine]:
     target = operation.target
     if target.type == "line":
         return [line for line in draft.lines if line.line_id == target.line_id]
@@ -147,6 +275,37 @@ def _matching_lines(operation: UpdateItem, draft: DraftState) -> list[OrderLine]
     ]
 
 
+def _missing_target() -> Unsatisfiable:
+    return Unsatisfiable(
+        outcome="UNSATISFIABLE",
+        remedy="change_request",
+        reason="No Order line matches that target in the Draft order.",
+        resolution="Choose an existing Order line from the Draft order.",
+        key="target",
+    )
+
+
+def _ambiguous_target(matches: list[OrderLine], *, action: str) -> Incomplete:
+    return Incomplete(
+        outcome="INCOMPLETE",
+        remedy="ask_customer",
+        reason="More than one Order line matches that target.",
+        resolution=f"Ask the customer to identify which matching Order line to {action}.",
+        subject=matches[0].name,
+        key="target",
+        alternatives=[
+            Alternative(
+                value=line.line_id,
+                label=(
+                    describe_line(line)
+                    + (f"; instructions: {line.instructions}" if line.instructions else "")
+                ),
+            )
+            for line in matches
+        ],
+    )
+
+
 def _validate_selected_servings(
     operation: UpdateItem,
     draft: DraftState,
@@ -155,32 +314,9 @@ def _validate_selected_servings(
 ) -> tuple[list[OrderLine], int] | Incomplete | Unsatisfiable:
     matches = _matching_lines(operation, draft)
     if not matches:
-        return Unsatisfiable(
-            outcome="UNSATISFIABLE",
-            remedy="change_request",
-            reason="No Order line matches that target in the Draft order.",
-            resolution="Choose an existing Order line from the Draft order.",
-            key="target",
-        )
+        return _missing_target()
     if operation.servings is None and len(matches) > 1:
-        return Incomplete(
-            outcome="INCOMPLETE",
-            remedy="ask_customer",
-            reason="More than one Order line matches that target.",
-            resolution=f"Ask the customer to identify which matching Order line to {action}.",
-            subject=matches[0].name,
-            key="target",
-            alternatives=[
-                Alternative(
-                    value=line.line_id,
-                    label=(
-                        describe_line(line)
-                        + (f"; instructions: {line.instructions}" if line.instructions else "")
-                    ),
-                )
-                for line in matches
-            ],
-        )
+        return _ambiguous_target(matches, action=action)
 
     available = sum(line.quantity for line in matches)
     selected = available if operation.servings == "all" else operation.servings
