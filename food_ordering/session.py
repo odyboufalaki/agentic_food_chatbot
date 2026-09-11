@@ -3,11 +3,13 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 from uuid import uuid4
 
+from food_ordering.model_adapter import TranscriptTurn
 from food_ordering.order import ClarificationContext, OrderLine
 from food_ordering.proposals import Proposal
 
 
 OrderStatus = Literal["draft", "submitted", "rejected", "application_error", "uncertain"]
+TRANSCRIPT_TURN_LIMIT = 12
 
 
 @dataclass(frozen=True)
@@ -36,6 +38,9 @@ class Session:
     instructions: str = ""
     next_line_number: int = 1
     history: deque[dict[str, str]] = field(default_factory=lambda: deque(maxlen=12))
+    transcript: deque[TranscriptTurn] = field(
+        default_factory=lambda: deque(maxlen=TRANSCRIPT_TURN_LIMIT),
+    )
     session_id: str = field(default_factory=lambda: uuid4().hex)
     turn_id: int = 0
     revision: int = 0
