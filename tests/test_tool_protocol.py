@@ -450,6 +450,15 @@ def test_review_snapshot_freezes_python_owned_review_and_restaurant_payload() ->
     )
 
     assert review.payload.items[0].item_id == "fries"
+    review.payload.items[0].quantity = 9
+    assert review.restaurant_payload() == {
+        "items": [{
+            "item_id": "fries",
+            "quantity": 1,
+            "options": {"size": "regular"},
+            "extras": [],
+        }],
+    }
 
 
 def test_forbidden_migration_fields_are_absent_from_the_parallel_contract() -> None:

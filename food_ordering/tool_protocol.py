@@ -5,7 +5,7 @@ defines the parallel protocol that later migration tickets can connect to
 deterministic validators and turn orchestration.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 from typing import Annotated, Any, Literal, Self, TypeAlias, cast
 
@@ -368,6 +368,17 @@ class ReviewSnapshot:
     reviewed_at_turn: int
     rendered_order: str
     payload: RestaurantPayload
+    _frozen_payload: str = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "_frozen_payload", serialize_payload(self.payload))
+
+    def restaurant_payload(self) -> dict[str, Any]:
+        """Return a fresh wire copy of the payload frozen when the review was built."""
+
+        payload = json.loads(self._frozen_payload)
+        assert isinstance(payload, dict)
+        return cast(dict[str, Any], payload)
 
 
 ModelValidationPayload: TypeAlias = Annotated[

@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeAlias
 
-from food_ordering.tool_protocol import ModelResult, StrictModel
+from food_ordering.tool_protocol import ModelResult, StrictModel, SubmissionResult
 
 
 @dataclass(frozen=True)
@@ -28,6 +28,7 @@ class AssistantMessage:
 
 AbortReason: TypeAlias = Literal[
     "customer_input_required",
+    "draft_mutation_in_batch",
     "model_response_truncated",
     "tool_call_budget_exhausted",
 ]
@@ -41,7 +42,7 @@ class AbortedToolResult(StrictModel):
     resolution: str
 
 
-ToolResultPayload: TypeAlias = ModelResult | AbortedToolResult
+ToolResultPayload: TypeAlias = ModelResult | SubmissionResult | AbortedToolResult
 
 
 @dataclass(frozen=True)

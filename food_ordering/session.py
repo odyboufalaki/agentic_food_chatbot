@@ -6,10 +6,12 @@ from uuid import uuid4
 from food_ordering.model_adapter import TranscriptTurn
 from food_ordering.order import ClarificationContext, OrderLine
 from food_ordering.proposals import Proposal
-from food_ordering.tool_protocol import DraftState
+from food_ordering.tool_protocol import DraftState, ReviewSnapshot, SubmissionResult
 
 
-OrderStatus = Literal["draft", "submitted", "rejected", "application_error", "uncertain"]
+OrderStatus = Literal[
+    "draft", "submitted", "rejected", "application_error", "not_sent", "uncertain",
+]
 TRANSCRIPT_TURN_LIMIT = 12
 
 
@@ -46,6 +48,9 @@ class Session:
     turn_id: int = 0
     revision: int = 0
     reviewed_revision: int | None = None
+    review_snapshot: ReviewSnapshot | None = None
+    last_submission_attempt_turn: int | None = None
+    submission_outcome: SubmissionResult | None = None
     status: OrderStatus = "draft"
     receipt_message: str = ""
     rejected_payload: dict[str, Any] | None = None
@@ -60,7 +65,32 @@ class Session:
         self.instructions = candidate.general_instructions
         self.next_line_number = candidate.next_line_number
         self.revision += 1
+        self._clear_checkout_state()
+
+    def invalidate_review(self) -> None:
+        """Clear confirmation eligibility unless the Session is permanently locked."""
+
+        if self.status in {"submitted", "uncertain"}:
+            return
         self.reviewed_revision = None
+        self.review_snapshot = None
+
+    def start_new_order(self) -> tuple[str, ...]:
+        """Start a clean Draft while preserving never-reused line identity."""
+
+        removed_line_ids = tuple(line.line_id for line in self.lines)
+        self.lines = []
+        self.instructions = ""
+        self.revision += 1
+        self.pending_change = None
+        self._clear_checkout_state()
+        return removed_line_ids
+
+    def _clear_checkout_state(self) -> None:
+        self.reviewed_revision = None
+        self.review_snapshot = None
+        self.last_submission_attempt_turn = None
+        self.submission_outcome = None
         self.status = "draft"
         self.receipt_message = ""
         self.rejected_payload = None

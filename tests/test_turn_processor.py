@@ -14,6 +14,7 @@ from food_ordering.model_adapter import (
 )
 from food_ordering.order import OrderLine
 from food_ordering.session import Session
+from food_ordering.submission import SubmissionResult
 from food_ordering.turn_processor import TurnProcessor
 
 
@@ -48,6 +49,929 @@ class ScriptedModel:
 
 def _payload(message: ToolResultMessage) -> Any:
     return message.payload.model_dump(mode="json", exclude_none=True)
+
+
+class RecordingSubmitter:
+    def __init__(self, *outcomes: SubmissionResult) -> None:
+        self._outcomes = iter(outcomes)
+        self.calls: list[dict[str, Any]] = []
+
+    def submit(self, payload: dict[str, Any]) -> SubmissionResult:
+        self.calls.append(payload)
+        return next(self._outcomes)
+
+
+def test_review_then_later_confirmation_submits_one_frozen_python_payload() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="add-burger",
+            name="add_item",
+            arguments={
+                "item_id": "classic_burger",
+                "quantity": 1,
+                "instructions": "no onions",
+            },
+        ),)),
+        AssistantMessage(content="Added."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="general-note",
+            name="set_order_instructions",
+            arguments={"instructions": "ring the bell"},
+        ),)),
+        AssistantMessage(content="Noted."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="review",
+            name="propose_submission",
+            arguments={},
+        ),)),
+        AssistantMessage(content="Untrusted model review text."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="confirmation",
+            name="submit_order",
+            arguments={},
+        ),)),
+    )
+    submitter = RecordingSubmitter(SubmissionResult(
+        status="submitted",
+        invoked=True,
+        result={
+            "success": True,
+            "order_id": "ORD-16",
+            "total": 8.5,
+            "estimated_time": "10 minutes",
+        },
+    ))
+    session = Session()
+    processor = TurnProcessor(
+        model=model,
+        menu=load_menu(),
+        session=session,
+        submitter=submitter,
+    )
+
+    processor.process("Add a burger without onions")
+    processor.process("Please ring the bell")
+    review = processor.process("Review my order")
+
+    assert review == {"message": (
+        "Draft order:\n"
+        "1 × Classic Burger (size: regular, patty: beef); instructions: no onions "
+        "— $8.50\n"
+        "General instructions: ring the bell\n"
+        "Total: $8.50\n"
+        "Please confirm: submit this exact order?"
+    )}
+    assert submitter.calls == []
+
+    receipt = processor.process("Yes, submit it")
+
+    expected_payload = {
+        "items": [{
+            "item_id": "classic_burger",
+            "quantity": 1,
+            "options": {"size": "regular", "patty": "beef"},
+            "extras": [],
+        }],
+        "special_instructions": (
+            "Item 1: 1 × Classic Burger (size: regular, patty: beef): no onions\n"
+            "General: ring the bell"
+        ),
+    }
+    assert submitter.calls == [expected_payload]
+    assert receipt == {"message": (
+        "Order accepted and submitted!\n"
+        "Order number: ORD-16\n"
+        "Reviewed total: $8.50\n"
+        "Restaurant total: $8.50\n"
+        "Estimated time: 10 minutes"
+    )}
+    assert session.status == "submitted"
+    assert session.reviewed_revision == session.revision == 2
+
+
+@pytest.mark.parametrize("submit_first", [False, True])
+def test_mutation_batch_preflight_blocks_submission_in_either_call_order(
+    submit_first: bool,
+) -> None:
+    review_call = ToolCall(call_id="review", name="propose_submission", arguments={})
+    edit_call = ToolCall(
+        call_id="edit",
+        name="change_quantity",
+        arguments={
+            "target": {"type": "line", "line_id": "L1"},
+            "mode": "set",
+            "quantity": 2,
+        },
+    )
+    submit_call = ToolCall(call_id="submit", name="submit_order", arguments={})
+    calls = (submit_call, edit_call) if submit_first else (edit_call, submit_call)
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(review_call,)),
+        AssistantMessage(content="Review shown."),
+        AssistantMessage(tool_calls=calls),
+        AssistantMessage(content="The order was changed and needs another review."),
+    )
+    submitter = RecordingSubmitter(SubmissionResult(
+        status="submitted",
+        invoked=True,
+        result={"success": True, "order_id": "MUST-NOT-HAPPEN"},
+    ))
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1",
+            item_id="classic_burger",
+            name="Classic Burger",
+            quantity=1,
+            options=(("size", "regular"), ("patty", "beef")),
+            extras=(),
+            instructions="",
+            unit_cents=850,
+        )],
+        next_line_number=2,
+        revision=1,
+    )
+    processor = TurnProcessor(
+        model=model,
+        menu=load_menu(),
+        session=session,
+        submitter=submitter,
+    )
+    processor.process("Review it")
+
+    processor.process("Yes, but make that two burgers")
+
+    assert submitter.calls == []
+    assert session.lines[0].quantity == 2
+    assert session.revision == 2
+    assert session.reviewed_revision is None
+    second_turn_results = [
+        message for message in session.transcript[1].messages
+        if isinstance(message, ToolResultMessage)
+    ]
+    submit_result = next(result for result in second_turn_results if result.name == "submit_order")
+    assert _payload(submit_result) == {
+        "error": "turn_aborted",
+        "reason": "draft_mutation_in_batch",
+        "resolution": "Review the resulting Draft and wait for a new customer turn.",
+    }
+
+
+@pytest.mark.parametrize(
+    "edit_call",
+    [
+        ToolCall(
+            call_id="invalid-option",
+            name="update_item",
+            arguments={
+                "target": {"type": "line", "line_id": "L1"},
+                "change": {"type": "customize", "options": {"size": "giant"}},
+            },
+        ),
+        ToolCall(
+            call_id="malformed-quantity",
+            name="change_quantity",
+            arguments={
+                "target": {"type": "line", "line_id": "L1"},
+                "mode": "set",
+                "quantity": 0,
+            },
+        ),
+    ],
+)
+def test_rejected_mutation_attempt_invalidates_review_eligibility(
+    edit_call: ToolCall,
+) -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="review",
+            name="propose_submission",
+            arguments={},
+        ),)),
+        AssistantMessage(content="Review shown."),
+        AssistantMessage(tool_calls=(edit_call,)),
+        AssistantMessage(content="That edit could not be applied."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="stale-confirmation",
+            name="submit_order",
+            arguments={},
+        ),)),
+        AssistantMessage(content="A new review is required."),
+    )
+    submitter = RecordingSubmitter(SubmissionResult(
+        status="submitted", invoked=True, result={"success": True},
+    ))
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1", item_id="classic_burger", name="Classic Burger",
+            quantity=1, options=(("size", "regular"), ("patty", "beef")),
+            extras=(), instructions="", unit_cents=850,
+        )],
+        next_line_number=2,
+        revision=1,
+    )
+    processor = TurnProcessor(
+        model=model, menu=load_menu(), session=session, submitter=submitter,
+    )
+    processor.process("Review it")
+
+    processor.process("Change it using an invalid value")
+
+    assert session.revision == 1
+    assert session.reviewed_revision is None
+    assert session.review_snapshot is None
+    processor.process("Yes")
+    assert submitter.calls == []
+
+
+def test_already_applied_mutation_preserves_an_eligible_review() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="review", name="propose_submission", arguments={},
+        ),)),
+        AssistantMessage(content="Review shown."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="same-quantity",
+            name="change_quantity",
+            arguments={
+                "target": {"type": "line", "line_id": "L1"},
+                "mode": "set",
+                "quantity": 1,
+            },
+        ),)),
+        AssistantMessage(content="It is already one burger."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="confirm", name="submit_order", arguments={},
+        ),)),
+    )
+    submitter = RecordingSubmitter(SubmissionResult(
+        status="submitted", invoked=True,
+        result={"success": True, "order_id": "ORD-NOOP", "total": 8.5},
+    ))
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1", item_id="classic_burger", name="Classic Burger",
+            quantity=1, options=(("size", "regular"), ("patty", "beef")),
+            extras=(), instructions="", unit_cents=850,
+        )],
+        next_line_number=2,
+        revision=1,
+    )
+    processor = TurnProcessor(
+        model=model, menu=load_menu(), session=session, submitter=submitter,
+    )
+    processor.process("Review it")
+
+    processor.process("Keep it at one")
+
+    assert session.reviewed_revision == 1
+    assert session.review_snapshot is not None
+    processor.process("Yes")
+    assert len(submitter.calls) == 1
+
+
+def test_rejection_allows_only_a_later_explicit_retry_of_the_frozen_payload() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="review", name="propose_submission", arguments={},
+        ),)),
+        AssistantMessage(content="Review shown."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="confirm", name="submit_order", arguments={},
+        ),)),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="automatic-retry", name="submit_order", arguments={},
+        ),)),
+        AssistantMessage(content="Untrusted rejection wording."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="customer-retry", name="submit_order", arguments={},
+        ),)),
+    )
+    rejected = SubmissionResult(
+        status="rejected",
+        invoked=True,
+        result={"success": False, "error": "Kitchen is busy"},
+    )
+    accepted = SubmissionResult(
+        status="submitted",
+        invoked=True,
+        result={"success": True, "order_id": "ORD-RETRY", "total": 8.5},
+    )
+    submitter = RecordingSubmitter(rejected, accepted)
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1", item_id="classic_burger", name="Classic Burger",
+            quantity=1, options=(("size", "regular"), ("patty", "beef")),
+            extras=(), instructions="", unit_cents=850,
+        )],
+        next_line_number=2,
+        revision=1,
+    )
+    processor = TurnProcessor(
+        model=model, menu=load_menu(), session=session, submitter=submitter,
+    )
+    processor.process("Review it")
+
+    response = processor.process("Yes")
+
+    assert "Kitchen is busy" in response["message"]
+    assert session.status == "rejected"
+    assert len(submitter.calls) == 1
+    frozen_payload = submitter.calls[0]
+
+    receipt = processor.process("Please retry the same order")
+
+    assert "ORD-RETRY" in receipt["message"]
+    assert submitter.calls == [frozen_payload, frozen_payload]
+
+
+def test_not_sent_requires_a_new_review_before_another_attempt() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="review-1", name="propose_submission", arguments={},
+        ),)),
+        AssistantMessage(content="Review shown."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="confirm-1", name="submit_order", arguments={},
+        ),)),
+        AssistantMessage(content="Untrusted not-sent wording."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="premature-retry", name="submit_order", arguments={},
+        ),)),
+        AssistantMessage(content="Still untrusted."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="review-2", name="propose_submission", arguments={},
+        ),)),
+        AssistantMessage(content="Review shown again."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="confirm-2", name="submit_order", arguments={},
+        ),)),
+    )
+    submitter = RecordingSubmitter(
+        SubmissionResult(
+            status="not_sent", invoked=False,
+            result={"client_error": "configuration", "outcome": "not_sent"},
+        ),
+        SubmissionResult(
+            status="submitted", invoked=True,
+            result={"success": True, "order_id": "ORD-AFTER-REVIEW"},
+        ),
+    )
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1", item_id="fries", name="French Fries", quantity=1,
+            options=(("size", "medium"),), extras=(), instructions="",
+            unit_cents=350,
+        )],
+        next_line_number=2,
+        revision=1,
+    )
+    processor = TurnProcessor(
+        model=model, menu=load_menu(), session=session, submitter=submitter,
+    )
+    processor.process("Review")
+    failed = processor.process("Yes")
+
+    assert "definitely not sent" in failed["message"]
+    assert session.status == "not_sent"
+    assert session.review_snapshot is None
+    processor.process("Try it now")
+    assert len(submitter.calls) == 1
+
+    processor.process("Review again")
+    receipt = processor.process("Yes")
+
+    assert "ORD-AFTER-REVIEW" in receipt["message"]
+    assert len(submitter.calls) == 2
+
+
+def test_uncertain_submission_persistently_blocks_mutation_reset_and_resubmission() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="review", name="propose_submission", arguments={},
+        ),)),
+        AssistantMessage(content="Review shown."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="confirm", name="submit_order", arguments={},
+        ),)),
+        AssistantMessage(content="Untrusted uncertainty wording."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="mutate",
+            name="change_quantity",
+            arguments={
+                "target": {"type": "line", "line_id": "L1"},
+                "mode": "set",
+                "quantity": 2,
+            },
+        ),)),
+        AssistantMessage(content="Untrusted mutation wording."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="reset", name="start_new_order", arguments={},
+        ),)),
+        AssistantMessage(content="Untrusted reset wording."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="resubmit", name="submit_order", arguments={},
+        ),)),
+        AssistantMessage(content="Untrusted retry wording."),
+    )
+    submitter = RecordingSubmitter(SubmissionResult(
+        status="uncertain", invoked=True,
+        result={"client_error": "submission_failed", "outcome": "uncertain"},
+    ))
+    original = OrderLine(
+        line_id="L1", item_id="fries", name="French Fries", quantity=1,
+        options=(("size", "medium"),), extras=(), instructions="",
+        unit_cents=350,
+    )
+    session = Session(lines=[original], next_line_number=2, revision=1)
+    processor = TurnProcessor(
+        model=model, menu=load_menu(), session=session, submitter=submitter,
+    )
+    processor.process("Review")
+
+    uncertain = processor.process("Yes")
+    mutation = processor.process("Make it two")
+    reset = processor.process("Start over")
+    retry = processor.process("Try submitting again")
+
+    assert "uncertain" in uncertain["message"]
+    assert "uncertain" in mutation["message"]
+    assert "uncertain" in reset["message"]
+    assert "uncertain" in retry["message"]
+    assert session.status == "uncertain"
+    assert session.lines == [original]
+    assert session.revision == 1
+    assert len(submitter.calls) == 1
+
+
+def test_review_and_confirmation_in_one_customer_turn_never_submit() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(
+            ToolCall(call_id="review", name="propose_submission", arguments={}),
+            ToolCall(call_id="confirm", name="submit_order", arguments={}),
+        )),
+        AssistantMessage(content="Wait for later confirmation."),
+    )
+    submitter = RecordingSubmitter(SubmissionResult(
+        status="submitted", invoked=True, result={"success": True},
+    ))
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1", item_id="fries", name="French Fries", quantity=1,
+            options=(("size", "medium"),), extras=(), instructions="",
+            unit_cents=350,
+        )],
+        next_line_number=2,
+        revision=1,
+    )
+
+    response = TurnProcessor(
+        model=model, menu=load_menu(), session=session, submitter=submitter,
+    ).process("Review and submit it")
+
+    assert "Please confirm" in response["message"]
+    assert submitter.calls == []
+    assert session.review_snapshot is not None
+    assert session.review_snapshot.reviewed_at_turn == session.turn_id == 1
+
+
+def test_stale_review_revision_never_authorizes_submission() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="review", name="propose_submission", arguments={},
+        ),)),
+        AssistantMessage(content="Review shown."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="confirm", name="submit_order", arguments={},
+        ),)),
+        AssistantMessage(content="A new review is required."),
+    )
+    submitter = RecordingSubmitter(SubmissionResult(
+        status="submitted", invoked=True, result={"success": True},
+    ))
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1", item_id="fries", name="French Fries", quantity=1,
+            options=(("size", "medium"),), extras=(), instructions="",
+            unit_cents=350,
+        )],
+        next_line_number=2,
+        revision=1,
+    )
+    processor = TurnProcessor(
+        model=model, menu=load_menu(), session=session, submitter=submitter,
+    )
+    processor.process("Review")
+    session.revision = 2
+
+    processor.process("Yes")
+
+    assert submitter.calls == []
+
+
+def test_total_mismatch_is_reported_and_repeated_confirmation_does_not_call_again() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="review", name="propose_submission", arguments={},
+        ),)),
+        AssistantMessage(content="Review shown."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="confirm", name="submit_order", arguments={},
+        ),)),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="confirm-again", name="submit_order", arguments={},
+        ),)),
+    )
+    submitter = RecordingSubmitter(SubmissionResult(
+        status="submitted", invoked=True,
+        result={"success": True, "order_id": "ORD-ONCE", "total": 4.0},
+    ))
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1", item_id="fries", name="French Fries", quantity=1,
+            options=(("size", "medium"),), extras=(), instructions="",
+            unit_cents=350,
+        )],
+        next_line_number=2,
+        revision=1,
+    )
+    processor = TurnProcessor(
+        model=model, menu=load_menu(), session=session, submitter=submitter,
+    )
+    processor.process("Review")
+    receipt = processor.process("Yes")
+    assert "Restaurant total: $4.00 (differs from reviewed total)" in receipt["message"]
+
+    repeated = processor.process("Yes again")
+
+    assert repeated == receipt
+    assert len(submitter.calls) == 1
+
+
+def test_application_error_requires_a_changed_draft_before_a_new_review() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="review-1", name="propose_submission", arguments={},
+        ),)),
+        AssistantMessage(content="Review shown."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="confirm-1", name="submit_order", arguments={},
+        ),)),
+        AssistantMessage(content="Untrusted application-error wording."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="unchanged-review", name="propose_submission", arguments={},
+        ),)),
+        AssistantMessage(content="Untrusted retry wording."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="edit",
+            name="change_quantity",
+            arguments={
+                "target": {"type": "line", "line_id": "L1"},
+                "mode": "set",
+                "quantity": 2,
+            },
+        ),)),
+        AssistantMessage(content="Changed."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="review-2", name="propose_submission", arguments={},
+        ),)),
+        AssistantMessage(content="Review shown."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="confirm-2", name="submit_order", arguments={},
+        ),)),
+    )
+    submitter = RecordingSubmitter(
+        SubmissionResult(
+            status="application_error", invoked=True,
+            result={"code": -32602, "message": "invalid arguments"},
+        ),
+        SubmissionResult(
+            status="submitted", invoked=True,
+            result={"success": True, "order_id": "ORD-CORRECTED"},
+        ),
+    )
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1", item_id="fries", name="French Fries", quantity=1,
+            options=(("size", "medium"),), extras=(), instructions="",
+            unit_cents=350,
+        )],
+        next_line_number=2,
+        revision=1,
+    )
+    processor = TurnProcessor(
+        model=model, menu=load_menu(), session=session, submitter=submitter,
+    )
+    processor.process("Review")
+    processor.process("Yes")
+
+    blocked = processor.process("Review the same order")
+
+    assert "application error" in blocked["message"]
+    assert len(submitter.calls) == 1
+    processor.process("Make it two")
+    processor.process("Review the corrected order")
+    receipt = processor.process("Yes")
+    assert "ORD-CORRECTED" in receipt["message"]
+    assert len(submitter.calls) == 2
+
+
+def test_start_new_order_after_submission_clears_the_entire_lifecycle() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="review", name="propose_submission", arguments={},
+        ),)),
+        AssistantMessage(content="Review shown."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="confirm", name="submit_order", arguments={},
+        ),)),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="new-order", name="start_new_order", arguments={},
+        ),)),
+        AssistantMessage(content="Started a new order."),
+    )
+    submitter = RecordingSubmitter(SubmissionResult(
+        status="submitted", invoked=True,
+        result={"success": True, "order_id": "ORD-DONE"},
+    ))
+    session = Session(
+        lines=[OrderLine(
+            line_id="L7", item_id="fries", name="French Fries", quantity=1,
+            options=(("size", "medium"),), extras=(), instructions="crispy",
+            unit_cents=350,
+        )],
+        instructions="no cutlery",
+        next_line_number=8,
+        revision=4,
+    )
+    processor = TurnProcessor(
+        model=model, menu=load_menu(), session=session, submitter=submitter,
+    )
+    processor.process("Review")
+    processor.process("Yes")
+
+    processor.process("Start a new order")
+
+    assert session.status == "draft"
+    assert session.lines == []
+    assert session.instructions == ""
+    assert session.next_line_number == 8
+    assert session.revision == 5
+    assert session.reviewed_revision is None
+    assert session.review_snapshot is None
+    assert session.submission_outcome is None
+
+
+@pytest.mark.parametrize(
+    ("session", "expected_rule"),
+    [
+        (Session(), "valid_order"),
+        (
+            Session(
+                lines=[OrderLine(
+                    line_id="L1", item_id="classic_burger", name="Classic Burger",
+                    quantity=6,
+                    options=(("size", "regular"), ("patty", "beef")),
+                    extras=(), instructions="", unit_cents=850,
+                )],
+                next_line_number=2,
+                revision=1,
+            ),
+            "maximum_total",
+        ),
+    ],
+)
+def test_empty_or_over_limit_draft_cannot_create_a_review_or_submit(
+    session: Session,
+    expected_rule: str,
+) -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="invalid-review", name="propose_submission", arguments={},
+        ),)),
+        AssistantMessage(content="The Draft cannot be reviewed yet."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="confirm-without-review", name="submit_order", arguments={},
+        ),)),
+        AssistantMessage(content="There is no eligible review."),
+    )
+    submitter = RecordingSubmitter(SubmissionResult(
+        status="submitted", invoked=True, result={"success": True},
+    ))
+    processor = TurnProcessor(
+        model=model, menu=load_menu(), session=session, submitter=submitter,
+    )
+
+    processor.process("Review")
+
+    result = next(
+        message for message in session.transcript[0].messages
+        if isinstance(message, ToolResultMessage)
+    )
+    assert _payload(result)["outcome"] == "CART_INVALID"
+    assert _payload(result)["rule"] == expected_rule
+    assert session.review_snapshot is None
+    processor.process("Yes")
+    assert submitter.calls == []
+
+
+def test_failed_model_turn_after_review_invalidates_confirmation() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="review", name="propose_submission", arguments={},
+        ),)),
+        AssistantMessage(content="Review shown."),
+    )
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1", item_id="fries", name="French Fries", quantity=1,
+            options=(("size", "medium"),), extras=(), instructions="",
+            unit_cents=350,
+        )],
+        next_line_number=2,
+        revision=1,
+    )
+    processor = TurnProcessor(model=model, menu=load_menu(), session=session)
+    processor.process("Review")
+    assert session.review_snapshot is not None
+
+    processor.process("A request the model fails to interpret")
+
+    assert session.reviewed_revision is None
+    assert session.review_snapshot is None
+
+
+def test_invalid_new_order_attempt_after_review_invalidates_confirmation() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="review", name="propose_submission", arguments={},
+        ),)),
+        AssistantMessage(content="Review shown."),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="invalid-reset", name="start_new_order", arguments={},
+        ),)),
+        AssistantMessage(content="The current Draft remains active."),
+    )
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1", item_id="fries", name="French Fries", quantity=1,
+            options=(("size", "medium"),), extras=(), instructions="",
+            unit_cents=350,
+        )],
+        next_line_number=2,
+        revision=1,
+    )
+    processor = TurnProcessor(model=model, menu=load_menu(), session=session)
+    processor.process("Review")
+
+    processor.process("Start a new order")
+
+    assert session.status == "draft"
+    assert session.reviewed_revision is None
+    assert session.review_snapshot is None
+
+
+def test_reused_call_id_on_a_malformed_mutation_invalidates_the_new_review() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(
+            ToolCall(call_id="reused", name="propose_submission", arguments={}),
+            ToolCall(
+                call_id="reused",
+                name="change_quantity",
+                arguments={
+                    "target": {"type": "line", "line_id": "L1"},
+                    "mode": "set",
+                    "quantity": 2,
+                },
+            ),
+        )),
+        AssistantMessage(content="The malformed edit needs a new review."),
+    )
+    session = Session(
+        lines=[OrderLine(
+            line_id="L1", item_id="fries", name="French Fries", quantity=1,
+            options=(("size", "medium"),), extras=(), instructions="",
+            unit_cents=350,
+        )],
+        next_line_number=2,
+        revision=1,
+    )
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Review it and make a malformed edit",
+    )
+
+    assert session.revision == 1
+    assert session.reviewed_revision is None
+    assert session.review_snapshot is None
+
+
+@pytest.mark.parametrize(
+    ("operation", "session"),
+    [
+        (
+            ToolCall(
+                call_id="add",
+                name="add_item",
+                arguments={"item_id": "fries", "quantity": 1},
+            ),
+            Session(
+                lines=[OrderLine(
+                    line_id="L1", item_id="classic_burger", name="Classic Burger",
+                    quantity=1,
+                    options=(("size", "regular"), ("patty", "beef")),
+                    extras=(), instructions="", unit_cents=850,
+                )],
+                next_line_number=2,
+                revision=1,
+            ),
+        ),
+        (
+            ToolCall(
+                call_id="update",
+                name="update_item",
+                arguments={
+                    "target": {"type": "line", "line_id": "L1"},
+                    "change": {"type": "customize", "add_extras": ["cheese"]},
+                },
+            ),
+            Session(
+                lines=[OrderLine(
+                    line_id="L1", item_id="classic_burger", name="Classic Burger",
+                    quantity=1,
+                    options=(("size", "regular"), ("patty", "beef")),
+                    extras=(), instructions="", unit_cents=850,
+                )],
+                next_line_number=2,
+                revision=1,
+            ),
+        ),
+        (
+            ToolCall(
+                call_id="remove",
+                name="remove_item",
+                arguments={"target": {"type": "line", "line_id": "L1"}},
+            ),
+            Session(
+                lines=[OrderLine(
+                    line_id="L1", item_id="fries", name="French Fries", quantity=1,
+                    options=(("size", "medium"),), extras=(), instructions="",
+                    unit_cents=350,
+                )],
+                next_line_number=2,
+                revision=1,
+            ),
+        ),
+        (
+            ToolCall(call_id="clear", name="clear_draft", arguments={}),
+            Session(
+                lines=[OrderLine(
+                    line_id="L1", item_id="fries", name="French Fries", quantity=1,
+                    options=(("size", "medium"),), extras=(), instructions="",
+                    unit_cents=350,
+                )],
+                next_line_number=2,
+                revision=1,
+            ),
+        ),
+        (
+            ToolCall(
+                call_id="instructions",
+                name="set_order_instructions",
+                arguments={"instructions": "no cutlery"},
+            ),
+            Session(
+                lines=[OrderLine(
+                    line_id="L1", item_id="fries", name="French Fries", quantity=1,
+                    options=(("size", "medium"),), extras=(), instructions="",
+                    unit_cents=350,
+                )],
+                next_line_number=2,
+                revision=1,
+            ),
+        ),
+    ],
+)
+def test_every_changed_draft_operation_invalidates_the_review(
+    operation: ToolCall,
+    session: Session,
+) -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="review", name="propose_submission", arguments={},
+        ),)),
+        AssistantMessage(content="Review shown."),
+        AssistantMessage(tool_calls=(operation,)),
+        AssistantMessage(content="Changed."),
+    )
+    processor = TurnProcessor(model=model, menu=load_menu(), session=session)
+    processor.process("Review")
+    assert session.review_snapshot is not None
+
+    processor.process("Change the Draft")
+
+    assert session.revision == 2
+    assert session.reviewed_revision is None
+    assert session.review_snapshot is None
 
 
 def test_model_can_read_menu_result_then_complete_a_natural_response() -> None:

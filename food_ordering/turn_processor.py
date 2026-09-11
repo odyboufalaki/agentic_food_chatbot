@@ -1,6 +1,8 @@
 """Bounded, provider-neutral orchestration for one customer turn."""
 
 from collections.abc import Callable
+from decimal import Decimal, InvalidOperation
+from uuid import uuid4
 
 from food_ordering.draft_operations import (
     validate_add_item,
@@ -24,11 +26,24 @@ from food_ordering.model_adapter import (
     TranscriptTurn,
     TurnModel,
 )
-from food_ordering.order import OrderLine, display_groups, render_draft
+from food_ordering.order import (
+    InvalidSelection,
+    OrderLine,
+    display_groups,
+    render_draft,
+    submission_payload,
+)
 from food_ordering.session import Session
+from food_ordering.submission import (
+    MCPSubmitter,
+    SubmissionResult as TransportSubmissionResult,
+    Submitter,
+    render_receipt,
+)
 from food_ordering.tool_protocol import (
     AddItem,
     AlreadyAppliedPayload,
+    ApplicationErrorPayload,
     AppliedEffect,
     AppliedPayload,
     CartInvalid,
@@ -45,14 +60,24 @@ from food_ordering.tool_protocol import (
     MenuSnapshot,
     Malformed,
     ModelResult,
+    NotSentPayload,
     Operation,
+    ProposeSubmission,
     ResultPayload,
     RemoveItem,
+    RejectedSubmissionPayload,
+    RestaurantPayload,
+    ReviewSnapshot,
+    ReviewedPayload,
     SchemaIssue,
     SetOrderInstructions,
     ShowDraft,
     ShowMenu,
+    StartNewOrder,
     StoredLineSnapshot,
+    SubmitOrder,
+    SubmittedPayload,
+    UncertainSubmissionPayload,
     Unsatisfiable,
     UpdateItem,
     Valid,
@@ -66,6 +91,16 @@ MAX_MALFORMED_CORRECTIONS = 2
 SAFE_FALLBACK = (
     "I couldn't finish that request safely. Your draft is unchanged. Please try again."
 )
+REVIEW_CONFIRMATION = "Please confirm: submit this exact order?"
+DRAFT_MUTATION_TOOL_NAMES = frozenset({
+    "add_item",
+    "update_item",
+    "change_quantity",
+    "remove_item",
+    "clear_draft",
+    "set_order_instructions",
+    "start_new_order",
+})
 
 
 def _tool_specs() -> tuple[ToolSpec, ...]:
@@ -165,7 +200,7 @@ def _draft_snapshot(session: Session) -> DraftSnapshot:
 
 
 def _violation_fingerprint(
-    payload: ModelResult | AbortedToolResult,
+    payload: object,
 ) -> tuple[str, str | None, str | None] | None:
     if isinstance(payload, (Incomplete, Unsatisfiable)):
         return payload.outcome, payload.subject, payload.key
@@ -198,14 +233,17 @@ class TurnProcessor:
         model: TurnModel,
         menu: Menu,
         session: Session,
+        submitter: Submitter | None = None,
         operation_observer: Callable[[ToolCall, Operation], None] | None = None,
     ) -> None:
         self._model = model
         self._menu = menu
         self._session = session
+        self._submitter = submitter if submitter is not None else MCPSubmitter()
         self._operation_observer = operation_observer
 
     def process(self, customer_message: str) -> dict[str, str]:
+        self._session.turn_id += 1
         starting_revision = self._session.revision
         current_turn: list[ModelMessage] = [CustomerMessage(customer_message)]
         messages = [
@@ -224,6 +262,7 @@ class TurnProcessor:
             try:
                 response = self._model.complete(messages=messages, tools=_tool_specs())
             except Exception:
+                self._session.invalidate_review()
                 return self._fallback(current_turn, starting_revision)
             if response.completion_status == "truncated":
                 current_turn.append(response)
@@ -245,7 +284,7 @@ class TurnProcessor:
             messages.append(response)
             if not response.tool_calls:
                 if response.content.strip():
-                    message = response.content
+                    message = self._authoritative_message(current_turn) or response.content
                     if self._session.revision != starting_revision:
                         message += "\n\n" + render_draft(
                             self._session.lines,
@@ -258,6 +297,10 @@ class TurnProcessor:
 
             budget_exhausted = False
             repeated_violation = False
+            mutation_in_batch = any(
+                call.name in DRAFT_MUTATION_TOOL_NAMES
+                for call in response.tool_calls
+            )
             for call in response.tool_calls:
                 if tool_calls >= MAX_TOOL_CALLS_PER_TURN:
                     budget_exhausted = True
@@ -269,12 +312,35 @@ class TurnProcessor:
                     tool_calls += 1
                     previous = processed_calls.get(call.call_id)
                     if previous is None:
-                        result = self._dispatch(call)
+                        if customer_input_required and call.name == "propose_submission":
+                            result = _aborted_tool_result(
+                                call,
+                                "customer_input_required",
+                            )
+                        elif mutation_in_batch and call.name == "submit_order":
+                            result = ToolResultMessage(
+                                call.call_id,
+                                call.name,
+                                AbortedToolResult(
+                                    error="turn_aborted",
+                                    reason="draft_mutation_in_batch",
+                                    resolution=(
+                                        "Review the resulting Draft and wait for a new "
+                                        "customer turn."
+                                    ),
+                                ),
+                            )
+                        else:
+                            result = self._dispatch(call)
                         processed_calls[call.call_id] = (call, result)
                     else:
                         result = self._replay_result(call, *previous)
                 current_turn.append(result)
                 messages.append(result)
+                if isinstance(result.payload, SubmittedPayload):
+                    current_turn.append(AssistantMessage(content=result.payload.receipt))
+                    self._session.transcript.append(TranscriptTurn(tuple(current_turn)))
+                    return {"message": result.payload.receipt}
                 if isinstance(result.payload, Malformed):
                     malformed_calls += 1
                 fingerprint = _violation_fingerprint(result.payload)
@@ -295,6 +361,20 @@ class TurnProcessor:
         current_turn: list[ModelMessage],
         starting_revision: int,
     ) -> dict[str, str]:
+        self._session.invalidate_review()
+        if self._session.status == "submitted" and self._session.receipt_message:
+            message = self._session.receipt_message
+            current_turn.append(AssistantMessage(content=message))
+            self._session.transcript.append(TranscriptTurn(tuple(current_turn)))
+            return {"message": message}
+        if self._session.status == "uncertain" and isinstance(
+            self._session.submission_outcome, UncertainSubmissionPayload,
+        ):
+            outcome = self._session.submission_outcome
+            message = outcome.reason + " " + outcome.resolution
+            current_turn.append(AssistantMessage(content=message))
+            self._session.transcript.append(TranscriptTurn(tuple(current_turn)))
+            return {"message": message}
         message = SAFE_FALLBACK
         if self._session.revision != starting_revision:
             message = (
@@ -305,6 +385,24 @@ class TurnProcessor:
         self._session.transcript.append(TranscriptTurn(tuple(current_turn)))
         return {"message": message}
 
+    @staticmethod
+    def _authoritative_message(current_turn: list[ModelMessage]) -> str | None:
+        for message in reversed(current_turn):
+            if isinstance(message, ToolResultMessage):
+                if isinstance(message.payload, ReviewedPayload):
+                    return message.payload.review
+                if isinstance(
+                    message.payload,
+                    (
+                        RejectedSubmissionPayload,
+                        ApplicationErrorPayload,
+                        NotSentPayload,
+                        UncertainSubmissionPayload,
+                    ),
+                ):
+                    return message.payload.reason + " " + message.payload.resolution
+        return None
+
     def _replay_result(
         self,
         call: ToolCall,
@@ -312,6 +410,8 @@ class TurnProcessor:
         previous_result: ToolResultMessage,
     ) -> ToolResultMessage:
         if call.name != previous_call.name or call.arguments != previous_call.arguments:
+            if call.name in DRAFT_MUTATION_TOOL_NAMES:
+                self._session.invalidate_review()
             return ToolResultMessage(
                 call.call_id,
                 call.name,
@@ -341,6 +441,8 @@ class TurnProcessor:
 
     def _dispatch(self, call: ToolCall) -> ToolResultMessage:
         if not call.call_id.strip():
+            if call.name in DRAFT_MUTATION_TOOL_NAMES:
+                self._session.invalidate_review()
             return ToolResultMessage(
                 call.call_id,
                 call.name,
@@ -358,6 +460,8 @@ class TurnProcessor:
             )
         operation = parse_tool_call(call.name, call.arguments)
         if isinstance(operation, Malformed):
+            if call.name in DRAFT_MUTATION_TOOL_NAMES:
+                self._session.invalidate_review()
             return ToolResultMessage(
                 call.call_id,
                 call.name,
@@ -398,6 +502,110 @@ class TurnProcessor:
                 result=_draft_snapshot(self._session),
             )
             return ToolResultMessage(call.call_id, call.name, payload)
+        if self._session.status == "uncertain" and isinstance(
+            self._session.submission_outcome, UncertainSubmissionPayload,
+        ):
+            return ToolResultMessage(
+                call.call_id,
+                call.name,
+                self._session.submission_outcome,
+            )
+        if isinstance(operation, StartNewOrder):
+            if self._session.status != "submitted":
+                self._session.invalidate_review()
+                return ToolResultMessage(
+                    call.call_id,
+                    call.name,
+                    Unsatisfiable(
+                        outcome="UNSATISFIABLE",
+                        remedy="change_request",
+                        reason="A new order can start only after definite acceptance.",
+                        resolution="Continue editing the current Draft order.",
+                        subject="order_lifecycle",
+                    ),
+                )
+            removed_line_ids = self._session.start_new_order()
+            return ToolResultMessage(
+                call.call_id,
+                call.name,
+                AppliedPayload(
+                    outcome="APPLIED",
+                    effect=AppliedEffect(
+                        operation="start_new_order",
+                        removed_line_ids=list(removed_line_ids),
+                    ),
+                    draft=_draft_snapshot(self._session),
+                ),
+            )
+        if isinstance(operation, ProposeSubmission):
+            if self._session.status == "submitted" and isinstance(
+                self._session.submission_outcome, SubmittedPayload,
+            ):
+                return ToolResultMessage(
+                    call.call_id,
+                    call.name,
+                    self._session.submission_outcome,
+                )
+            if self._session.status == "application_error" and isinstance(
+                self._session.submission_outcome, ApplicationErrorPayload,
+            ):
+                return ToolResultMessage(
+                    call.call_id,
+                    call.name,
+                    self._session.submission_outcome,
+                )
+            self._session.invalidate_review()
+            try:
+                raw_payload = submission_payload(
+                    self._session.lines,
+                    self._menu,
+                    self._session.instructions,
+                )
+            except InvalidSelection as error:
+                total_cents = sum(line.total_cents for line in self._session.lines)
+                return ToolResultMessage(
+                    call.call_id,
+                    call.name,
+                    CartInvalid(
+                        outcome="CART_INVALID",
+                        remedy="edit_draft",
+                        reason=str(error),
+                        resolution="Edit the Draft order, then request a new review.",
+                        rule="maximum_total" if total_cents > 5000 else "valid_order",
+                        current_cents=total_cents,
+                        limit_cents=5000 if total_cents > 5000 else None,
+                        excess_cents=total_cents - 5000 if total_cents > 5000 else None,
+                    ),
+                )
+            review_text = render_draft(
+                self._session.lines,
+                self._session.instructions,
+            ) + "\n" + REVIEW_CONFIRMATION
+            review = ReviewSnapshot(
+                review_id=uuid4().hex,
+                revision=self._session.revision,
+                reviewed_at_turn=self._session.turn_id,
+                rendered_order=review_text,
+                payload=RestaurantPayload.model_validate(raw_payload),
+            )
+            self._session.review_snapshot = review
+            self._session.reviewed_revision = review.revision
+            self._session.status = "draft"
+            self._session.submission_outcome = None
+            self._session.last_submission_attempt_turn = None
+            self._session.rejected_payload = None
+            self._session.application_error_payload = None
+            return ToolResultMessage(
+                call.call_id,
+                call.name,
+                ReviewedPayload(
+                    outcome="REVIEWED",
+                    review_id=review.review_id,
+                    review=review.rendered_order,
+                ),
+            )
+        if isinstance(operation, SubmitOrder):
+            return self._submit_reviewed_order(call)
         if isinstance(
             operation,
             (
@@ -409,6 +617,18 @@ class TurnProcessor:
                 SetOrderInstructions,
             ),
         ):
+            if self._session.status == "submitted":
+                return ToolResultMessage(
+                    call.call_id,
+                    call.name,
+                    Unsatisfiable(
+                        outcome="UNSATISFIABLE",
+                        remedy="change_request",
+                        reason="The current order was already accepted.",
+                        resolution="Call start_new_order before adding or editing selections.",
+                        subject="order_lifecycle",
+                    ),
+                )
             draft = DraftState(
                 lines=tuple(self._session.lines),
                 general_instructions=self._session.instructions,
@@ -435,6 +655,7 @@ class TurnProcessor:
             else:
                 validation = validate_set_order_instructions(operation, draft)
             if not isinstance(validation, Valid):
+                self._session.invalidate_review()
                 return ToolResultMessage(call.call_id, call.name, validation)
             if not validation.changed:
                 return ToolResultMessage(
@@ -466,3 +687,141 @@ class TurnProcessor:
             subject=call.name,
         )
         return ToolResultMessage(call.call_id, call.name, payload)
+
+    def _submit_reviewed_order(self, call: ToolCall) -> ToolResultMessage:
+        prior = self._session.submission_outcome
+        if self._session.status == "submitted" and isinstance(prior, SubmittedPayload):
+            return ToolResultMessage(call.call_id, call.name, prior)
+        if self._session.status == "uncertain" and isinstance(
+            prior, UncertainSubmissionPayload,
+        ):
+            return ToolResultMessage(call.call_id, call.name, prior)
+        if self._session.status == "application_error" and isinstance(
+            prior, ApplicationErrorPayload,
+        ):
+            return ToolResultMessage(call.call_id, call.name, prior)
+        if self._session.status == "not_sent" and isinstance(prior, NotSentPayload):
+            return ToolResultMessage(call.call_id, call.name, prior)
+        if (
+            self._session.status == "rejected"
+            and self._session.last_submission_attempt_turn == self._session.turn_id
+            and isinstance(prior, RejectedSubmissionPayload)
+        ):
+            return ToolResultMessage(call.call_id, call.name, prior)
+        review = self._session.review_snapshot
+        if (
+            review is None
+            or self._session.reviewed_revision != self._session.revision
+            or review.revision != self._session.revision
+        ):
+            return ToolResultMessage(
+                call.call_id,
+                call.name,
+                Unsatisfiable(
+                    outcome="UNSATISFIABLE",
+                    remedy="change_request",
+                    reason="The current Draft order has no eligible review.",
+                    resolution="Call propose_submission and wait for a later customer turn.",
+                    subject="confirmation",
+                ),
+            )
+        if review.reviewed_at_turn >= self._session.turn_id:
+            return ToolResultMessage(
+                call.call_id,
+                call.name,
+                Unsatisfiable(
+                    outcome="UNSATISFIABLE",
+                    remedy="change_request",
+                    reason="Confirmation must arrive after the Order review.",
+                    resolution="Wait for explicit confirmation on a later customer turn.",
+                    subject="confirmation",
+                ),
+            )
+        frozen_payload = review.restaurant_payload()
+        self._session.last_submission_attempt_turn = self._session.turn_id
+        self._session.status = "uncertain"
+        uncertain = UncertainSubmissionPayload(
+            outcome="UNCERTAIN",
+            remedy="block_resubmission",
+            reason="The order may have been accepted, but its outcome is uncertain.",
+            resolution=(
+                "Check with the restaurant; this Session will not mutate or submit again."
+            ),
+        )
+        self._session.submission_outcome = uncertain
+        try:
+            outcome = self._submitter.submit(frozen_payload)
+        except Exception:
+            outcome = TransportSubmissionResult(
+                status="uncertain",
+                invoked=True,
+                result={"client_error": "submission_failed", "outcome": "uncertain"},
+            )
+        reviewed_total = sum(line.total_cents for line in self._session.lines)
+        if outcome.status == "rejected":
+            explanation = outcome.result.get("error", "No explanation supplied")
+            rejected = RejectedSubmissionPayload(
+                outcome="REJECTED",
+                remedy="ask_customer_before_retry",
+                reason=f"The restaurant rejected the order: {explanation}.",
+                resolution=(
+                    "Your selections are preserved; a later explicit customer request may "
+                    "retry this exact reviewed order."
+                ),
+            )
+            self._session.status = "rejected"
+            self._session.submission_outcome = rejected
+            self._session.rejected_payload = frozen_payload
+            return ToolResultMessage(call.call_id, call.name, rejected)
+        if outcome.status == "application_error":
+            application_error = ApplicationErrorPayload(
+                outcome="APPLICATION_ERROR",
+                remedy="require_changed_draft",
+                reason="The restaurant reported an application error.",
+                resolution="Edit the Draft order and request a new review before submitting.",
+            )
+            self._session.status = "application_error"
+            self._session.submission_outcome = application_error
+            self._session.application_error_payload = frozen_payload
+            self._session.invalidate_review()
+            return ToolResultMessage(call.call_id, call.name, application_error)
+        if outcome.status == "not_sent":
+            not_sent = NotSentPayload(
+                outcome="NOT_SENT",
+                remedy="require_new_review",
+                reason="The order was definitely not sent.",
+                resolution="Check the connection or configuration, then request a new review.",
+            )
+            self._session.status = "not_sent"
+            self._session.submission_outcome = not_sent
+            self._session.invalidate_review()
+            return ToolResultMessage(call.call_id, call.name, not_sent)
+        if outcome.status == "uncertain":
+            self._session.status = "uncertain"
+            return ToolResultMessage(call.call_id, call.name, uncertain)
+        receipt = render_receipt(outcome.result, reviewed_total)
+        restaurant_total_cents = _restaurant_total_cents(outcome.result.get("total"))
+        payload = SubmittedPayload(
+            outcome="SUBMITTED",
+            receipt=receipt,
+            order_id=(str(outcome.result["order_id"])
+                      if outcome.result.get("order_id") is not None else None),
+            reviewed_total_cents=reviewed_total,
+            restaurant_total_cents=restaurant_total_cents,
+            estimated_time=(str(outcome.result["estimated_time"])
+                            if outcome.result.get("estimated_time") is not None else None),
+        )
+        self._session.status = "submitted"
+        self._session.receipt_message = receipt
+        self._session.submission_outcome = payload
+        return ToolResultMessage(call.call_id, call.name, payload)
+
+
+def _restaurant_total_cents(value: object) -> int | None:
+    try:
+        cents = Decimal(str(value)) * 100
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if not cents.is_finite() or cents != cents.to_integral_value():
+        return None
+    return int(cents)
