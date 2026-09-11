@@ -1,7 +1,5 @@
 """Bounded, provider-neutral orchestration for one customer turn."""
 
-from copy import deepcopy
-
 from food_ordering.draft_operations import validate_add_item, validate_customize_item
 from food_ordering.menu import Menu
 from food_ordering.model_adapter import (
@@ -24,6 +22,7 @@ from food_ordering.tool_protocol import (
     AppliedEffect,
     AppliedPayload,
     CartInvalid,
+    CustomizeServings,
     DisplayGroupSnapshot,
     DraftSnapshot,
     DraftState,
@@ -55,17 +54,13 @@ SAFE_FALLBACK = (
 )
 
 
+class _CustomizationUpdateItem(UpdateItem):
+    change: CustomizeServings
+
+
 def _tool_specs() -> tuple[ToolSpec, ...]:
     schemas = protocol_schema()["tools"]
-    update_schema = deepcopy(schemas["update_item"])
-    del update_schema["$defs"]["ReplaceServings"]
-    update_schema["properties"]["change"]["discriminator"]["mapping"] = {
-        "customize": "#/$defs/CustomizeServings",
-    }
-    update_schema["properties"]["change"]["oneOf"] = [
-        {"$ref": "#/$defs/CustomizeServings"},
-    ]
-    schemas["update_item"] = update_schema
+    schemas["update_item"] = _CustomizationUpdateItem.model_json_schema()
     descriptions = {
         "show_menu": "Return the complete Menu or the requested menu items.",
         "show_draft": "Return the complete authoritative Draft order.",
@@ -359,14 +354,15 @@ class TurnProcessor:
             )
             return ToolResultMessage(call.call_id, call.name, payload)
         if isinstance(operation, (AddItem, UpdateItem)):
+            draft = DraftState(
+                lines=tuple(self._session.lines),
+                general_instructions=self._session.instructions,
+                next_line_number=self._session.next_line_number,
+            )
             if isinstance(operation, AddItem):
                 validation = validate_add_item(
                     operation,
-                    DraftState(
-                        lines=tuple(self._session.lines),
-                        general_instructions=self._session.instructions,
-                        next_line_number=self._session.next_line_number,
-                    ),
+                    draft,
                     self._menu,
                 )
             else:
@@ -380,13 +376,9 @@ class TurnProcessor:
                     ))
                 validation = validate_customize_item(
                     operation,
-                    DraftState(
-                        lines=tuple(self._session.lines),
-                        general_instructions=self._session.instructions,
-                        next_line_number=self._session.next_line_number,
-                    ),
+                    draft,
                     self._menu,
-            )
+                )
             if not isinstance(validation, Valid):
                 return ToolResultMessage(call.call_id, call.name, validation)
             if not validation.changed:
