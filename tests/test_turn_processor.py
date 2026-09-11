@@ -50,7 +50,9 @@ def test_model_can_read_menu_result_then_complete_a_natural_response() -> None:
     )
 
     assert response == {"message": "We have burgers, pizza, sides, drinks, and desserts."}
-    assert [tool.name for tool in model.tool_specs[0]] == ["show_menu", "show_draft"]
+    assert [tool.name for tool in model.tool_specs[0]] == [
+        "show_menu", "show_draft", "add_item",
+    ]
     result = model.requests[1][-1]
     assert isinstance(result, ToolResultMessage)
     assert result.call_id == "call-1"
@@ -270,7 +272,7 @@ def test_tool_call_budget_pairs_the_over_budget_call_with_an_aborted_result() ->
     }
 
 
-def test_read_only_processor_rejects_mutation_and_leaves_authoritative_state_unchanged() -> None:
+def test_processor_rejects_unimplemented_mutation_and_leaves_state_unchanged() -> None:
     line = OrderLine(
         item_id="fries",
         name="French Fries",
@@ -307,10 +309,13 @@ def test_read_only_processor_rejects_mutation_and_leaves_authoritative_state_unc
     model = ScriptedModel(
         AssistantMessage(tool_calls=(ToolCall(
             call_id="mutation-1",
-            name="add_item",
-            arguments={"item_id": "classic_burger", "quantity": 1},
+            name="update_item",
+            arguments={
+                "target": {"type": "line", "line_id": "L2"},
+                "change": {"type": "customize", "add_extras": ["parmesan"]},
+            },
         ),)),
-        AssistantMessage(content="I can't change the order in this read-only flow."),
+        AssistantMessage(content="I can't make that change in this flow."),
     )
 
     TurnProcessor(model=model, menu=load_menu(), session=session).process("Add a burger")
@@ -461,13 +466,13 @@ def test_model_failure_after_a_read_result_preserves_pair_and_uses_fallback() ->
 
 
 def test_repeated_non_malformed_violation_stops_before_another_model_request() -> None:
-    mutation = {"item_id": "classic_burger", "quantity": 1}
+    missing_item = {"item_ids": ["lobster"]}
     model = ScriptedModel(
         AssistantMessage(tool_calls=(
-            ToolCall(call_id="mutation-1", name="add_item", arguments=mutation),
+            ToolCall(call_id="missing-1", name="show_menu", arguments=missing_item),
         )),
         AssistantMessage(tool_calls=(
-            ToolCall(call_id="mutation-2", name="add_item", arguments=mutation),
+            ToolCall(call_id="missing-2", name="show_menu", arguments=missing_item),
         )),
         AssistantMessage(content="This response must not be requested."),
     )
@@ -485,4 +490,392 @@ def test_repeated_non_malformed_violation_stops_before_another_model_request() -
         message for message in session.transcript[0].messages
         if isinstance(message, ToolResultMessage)
     ]
-    assert [result.call_id for result in results] == ["mutation-1", "mutation-2"]
+    assert [result.call_id for result in results] == ["missing-1", "missing-2"]
+
+
+def test_valid_burgers_commit_while_incomplete_milkshake_asks_for_flavor() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(
+            ToolCall(
+                call_id="burgers",
+                name="add_item",
+                arguments={"item_id": "classic_burger", "quantity": 2},
+            ),
+            ToolCall(
+                call_id="milkshake",
+                name="add_item",
+                arguments={"item_id": "milkshake", "quantity": 1},
+            ),
+        )),
+        AssistantMessage(content="I added two burgers. Which milkshake flavor would you like?"),
+    )
+    session = Session()
+
+    response = TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Two burgers and a milkshake",
+    )
+
+    assert response == {"message": (
+        "I added two burgers. Which milkshake flavor would you like?\n\n"
+        "Draft order:\n"
+        "2 × Classic Burger (size: regular, patty: beef) — $17.00\n"
+        "Total: $17.00"
+    )}
+    assert [tool.name for tool in model.tool_specs[0]] == [
+        "show_menu", "show_draft", "add_item",
+    ]
+    results = model.requests[1][-2:]
+    assert all(isinstance(result, ToolResultMessage) for result in results)
+    assert _payload(results[0]) == {
+        "outcome": "APPLIED",
+        "effect": {
+            "operation": "add_item",
+            "affected_line_ids": [],
+            "created_line_ids": ["L1"],
+            "removed_line_ids": [],
+        },
+        "draft": {
+            "revision": 1,
+            "lines": [{
+                "line_id": "L1",
+                "item_id": "classic_burger",
+                "name": "Classic Burger",
+                "quantity": 2,
+                "options": {"size": "regular", "patty": "beef"},
+                "extras": [],
+                "instructions": "",
+                "unit_cents": 850,
+                "total_cents": 1700,
+            }],
+            "display_groups": [{
+                "line_ids": ["L1"],
+                "item_id": "classic_burger",
+                "name": "Classic Burger",
+                "quantity": 2,
+                "options": {"size": "regular", "patty": "beef"},
+                "extras": [],
+                "instructions": "",
+                "unit_cents": 850,
+                "total_cents": 1700,
+            }],
+            "general_instructions": "",
+            "total_cents": 1700,
+            "checkout_state": "draft",
+        },
+    }
+    assert _payload(results[1]) == {
+        "outcome": "INCOMPLETE",
+        "remedy": "ask_customer",
+        "reason": "Milkshake requires a flavor.",
+        "resolution": "Ask the customer to choose a flavor.",
+        "subject": "Milkshake",
+        "key": "flavor",
+        "alternatives": [
+            {"value": "vanilla", "label": "vanilla"},
+            {"value": "chocolate", "label": "chocolate"},
+            {"value": "strawberry", "label": "strawberry"},
+            {"value": "oreo", "label": "oreo"},
+        ],
+    }
+    assert [(line.line_id, line.item_id, line.quantity, line.total_cents)
+            for line in session.lines] == [("L1", "classic_burger", 2, 1700)]
+    assert session.next_line_number == 2
+    assert session.revision == 1
+
+
+def test_flavor_answer_reconstructs_a_fresh_add_without_duplicating_prior_success() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(
+            ToolCall(
+                call_id="burger-first-turn",
+                name="add_item",
+                arguments={"item_id": "classic_burger", "quantity": 1},
+            ),
+            ToolCall(
+                call_id="incomplete-shake",
+                name="add_item",
+                arguments={"item_id": "milkshake", "quantity": 1},
+            ),
+        )),
+        AssistantMessage(content="Which milkshake flavor would you like?"),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="fresh-shake",
+            name="add_item",
+            arguments={
+                "item_id": "milkshake",
+                "quantity": 1,
+                "options": {"flavor": "chocolate"},
+            },
+        ),)),
+        AssistantMessage(content="I added one chocolate milkshake."),
+    )
+    session = Session()
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "A burger and a milkshake",
+    )
+    first_turn = session.transcript[0].messages
+    response = TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Chocolate",
+    )
+
+    assert response == {"message": (
+        "I added one chocolate milkshake.\n\n"
+        "Draft order:\n"
+        "1 × Classic Burger (size: regular, patty: beef) — $8.50\n"
+        "1 × Milkshake (size: regular, flavor: chocolate) — $5.50\n"
+        "Total: $14.00"
+    )}
+    assert model.requests[2] == first_turn + (CustomerMessage("Chocolate"),)
+    assert [(line.line_id, line.item_id, line.quantity, dict(line.options), line.total_cents)
+            for line in session.lines] == [
+        ("L1", "classic_burger", 1, {"size": "regular", "patty": "beef"}, 850),
+        ("L2", "milkshake", 1, {"size": "regular", "flavor": "chocolate"}, 550),
+    ]
+    assert session.revision == 2
+    assert session.next_line_number == 3
+    assert session.pending_change is None
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_outcome", "expected_key", "expected_alternatives"),
+    [
+        (
+            {"item_id": "lobster", "quantity": 1},
+            "UNSATISFIABLE",
+            "item_id",
+            ["classic_burger", "spicy_burger", "margherita"],
+        ),
+        (
+            {
+                "item_id": "classic_burger",
+                "quantity": 1,
+                "options": {"temperature": "hot"},
+            },
+            "UNSATISFIABLE",
+            "temperature",
+            ["size", "patty"],
+        ),
+        (
+            {
+                "item_id": "milkshake",
+                "quantity": 1,
+                "options": {"flavor": "mint"},
+            },
+            "INCOMPLETE",
+            "flavor",
+            ["vanilla", "chocolate", "strawberry", "oreo"],
+        ),
+        (
+            {
+                "item_id": "classic_burger",
+                "quantity": 1,
+                "extras": ["pickles"],
+            },
+            "UNSATISFIABLE",
+            "extras",
+            ["cheese", "bacon", "avocado", "extra_patty"],
+        ),
+    ],
+)
+def test_invalid_additions_return_structured_remedies_without_mutating_draft(
+    arguments: dict[str, Any],
+    expected_outcome: str,
+    expected_key: str,
+    expected_alternatives: list[str],
+) -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="invalid-add",
+            name="add_item",
+            arguments=arguments,
+        ),)),
+        AssistantMessage(content="Please choose from the available Menu choices."),
+    )
+    session = Session()
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Add this item",
+    )
+
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    payload = _payload(result)
+    assert payload["outcome"] == expected_outcome
+    assert payload["key"] == expected_key
+    assert [alternative["value"] for alternative in payload["alternatives"]][
+        :len(expected_alternatives)
+    ] == expected_alternatives
+    assert payload["reason"]
+    assert payload["resolution"]
+    assert session.lines == []
+    assert session.revision == 0
+    assert session.next_line_number == 1
+
+
+def test_addition_applies_defaults_deduplicates_extras_and_prices_in_python() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="configured-burgers",
+            name="add_item",
+            arguments={
+                "item_id": "burger",
+                "quantity": 2,
+                "options": {"size": "large", "patty": "veggie"},
+                "extras": ["cheese", "bacon", "cheese"],
+                "instructions": "  well done  ",
+            },
+        ),)),
+        AssistantMessage(content="I added the configured burgers."),
+    )
+    session = Session()
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Two large veggie burgers with cheese, bacon, and cheese, well done",
+    )
+
+    assert len(session.lines) == 1
+    line = session.lines[0]
+    assert (
+        line.line_id,
+        line.item_id,
+        line.quantity,
+        dict(line.options),
+        line.extras,
+        line.instructions,
+        line.unit_cents,
+        line.total_cents,
+    ) == (
+        "L1",
+        "classic_burger",
+        2,
+        {"size": "large", "patty": "veggie"},
+        ("bacon", "cheese"),
+        "well done",
+        1300,
+        2600,
+    )
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    assert _payload(result)["draft"]["total_cents"] == 2600
+
+
+def test_valid_additions_survive_malformed_and_unsatisfiable_siblings() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(
+            ToolCall(
+                call_id="valid-before",
+                name="add_item",
+                arguments={"item_id": "classic_burger", "quantity": 1},
+            ),
+            ToolCall(
+                call_id="malformed-middle",
+                name="add_item",
+                arguments={"item_id": "milkshake"},
+            ),
+            ToolCall(
+                call_id="valid-after",
+                name="add_item",
+                arguments={"item_id": "fries", "quantity": 1},
+            ),
+            ToolCall(
+                call_id="unsupported-last",
+                name="add_item",
+                arguments={"item_id": "lobster", "quantity": 1},
+            ),
+        )),
+        AssistantMessage(content="I added the burger and fries; the other requests need changes."),
+    )
+    session = Session()
+
+    response = TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Add a burger, milkshake, fries, and lobster",
+    )
+
+    assert response == {"message": (
+        "I added the burger and fries; the other requests need changes.\n\n"
+        "Draft order:\n"
+        "1 × Classic Burger (size: regular, patty: beef) — $8.50\n"
+        "1 × French Fries (size: medium) — $3.50\n"
+        "Total: $12.00"
+    )}
+    results = model.requests[1][-4:]
+    assert all(isinstance(result, ToolResultMessage) for result in results)
+    assert [_payload(result)["outcome"] for result in results] == [
+        "APPLIED", "MALFORMED", "APPLIED", "UNSATISFIABLE",
+    ]
+    assert [(line.line_id, line.item_id, line.total_cents) for line in session.lines] == [
+        ("L1", "classic_burger", 850),
+        ("L2", "fries", 350),
+    ]
+    assert session.revision == 2
+    assert session.next_line_number == 3
+
+
+def test_replayed_applied_call_is_idempotent_within_the_customer_turn() -> None:
+    call = ToolCall(
+        call_id="same-add-call",
+        name="add_item",
+        arguments={"item_id": "fries", "quantity": 1},
+    )
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(call,)),
+        AssistantMessage(tool_calls=(call,)),
+        AssistantMessage(content="The fries are in your draft."),
+    )
+    session = Session()
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process("Add fries")
+
+    first_result = model.requests[1][-1]
+    second_result = model.requests[2][-1]
+    assert isinstance(first_result, ToolResultMessage)
+    assert isinstance(second_result, ToolResultMessage)
+    assert _payload(first_result)["outcome"] == "APPLIED"
+    assert _payload(second_result) == {
+        "outcome": "ALREADY_APPLIED",
+        "operation": "add_item",
+        "draft": _payload(first_result)["draft"],
+    }
+    assert [(line.line_id, line.item_id, line.quantity) for line in session.lines] == [
+        ("L1", "fries", 1),
+    ]
+    assert session.revision == 1
+    assert session.next_line_number == 2
+
+
+def test_model_failure_after_addition_reports_partial_success_and_canonical_draft() -> None:
+    class FailingAfterAdditionModel:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def complete(
+            self, *, messages: Sequence[ModelMessage], tools: Sequence[ToolSpec],
+        ) -> AssistantMessage:
+            self.calls += 1
+            if self.calls == 1:
+                return AssistantMessage(tool_calls=(ToolCall(
+                    call_id="fries-before-failure",
+                    name="add_item",
+                    arguments={"item_id": "fries", "quantity": 1},
+                ),))
+            raise RuntimeError("private provider failure")
+
+    session = Session()
+
+    response = TurnProcessor(
+        model=FailingAfterAdditionModel(),
+        menu=load_menu(),
+        session=session,
+    ).process("Add fries")
+
+    assert response == {"message": (
+        "I couldn't finish that request safely, but some changes were applied.\n"
+        "Draft order:\n"
+        "1 × French Fries (size: medium) — $3.50\n"
+        "Total: $3.50"
+    )}
+    assert [(line.line_id, line.item_id, line.total_cents) for line in session.lines] == [
+        ("L1", "fries", 350),
+    ]
+    assert session.revision == 1
