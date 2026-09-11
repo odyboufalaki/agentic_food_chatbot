@@ -264,7 +264,7 @@ def test_tool_call_budget_pairs_the_over_budget_call_with_an_aborted_result() ->
     assert [_payload(result)["outcome"] for result in results[:8]] == ["RESULT"] * 8
     assert results[8].call_id == "draft-9"
     assert _payload(results[8]) == {
-        "outcome": "TURN_ABORTED",
+        "error": "turn_aborted",
         "reason": "tool_call_budget_exhausted",
         "resolution": "Wait for a new customer turn before using another tool.",
     }

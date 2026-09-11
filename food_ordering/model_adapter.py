@@ -26,11 +26,17 @@ class AssistantMessage:
     completion_status: Literal["complete", "truncated"] = "complete"
 
 
+AbortReason: TypeAlias = Literal[
+    "model_response_truncated",
+    "tool_call_budget_exhausted",
+]
+
+
 class AbortedToolResult(StrictModel):
     """Orchestration result for an emitted call that was not dispatched."""
 
-    outcome: Literal["TURN_ABORTED"]
-    reason: Literal["model_response_truncated", "tool_call_budget_exhausted"]
+    error: Literal["turn_aborted"]
+    reason: AbortReason
     resolution: str
 
 

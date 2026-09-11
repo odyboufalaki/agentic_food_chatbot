@@ -2,6 +2,7 @@
 
 from food_ordering.menu import Menu
 from food_ordering.model_adapter import (
+    AbortReason,
     AbortedToolResult,
     AssistantMessage,
     CustomerMessage,
@@ -140,6 +141,21 @@ def _violation_fingerprint(
     return None
 
 
+def _aborted_tool_result(
+    call: ToolCall,
+    reason: AbortReason,
+) -> ToolResultMessage:
+    return ToolResultMessage(
+        call.call_id,
+        call.name,
+        AbortedToolResult(
+            error="turn_aborted",
+            reason=reason,
+            resolution="Wait for a new customer turn before using another tool.",
+        ),
+    )
+
+
 class TurnProcessor:
     """Run one read-only model/tool/result loop."""
 
@@ -168,14 +184,9 @@ class TurnProcessor:
             if response.completion_status == "truncated":
                 current_turn.append(response)
                 for call in response.tool_calls:
-                    current_turn.append(ToolResultMessage(
-                        call.call_id,
-                        call.name,
-                        AbortedToolResult(
-                            outcome="TURN_ABORTED",
-                            reason="model_response_truncated",
-                            resolution="Wait for a new customer turn before using another tool.",
-                        ),
+                    current_turn.append(_aborted_tool_result(
+                        call,
+                        "model_response_truncated",
                     ))
                 return self._fallback(current_turn)
             current_turn.append(response)
@@ -191,14 +202,9 @@ class TurnProcessor:
             for call in response.tool_calls:
                 if tool_calls >= MAX_TOOL_CALLS_PER_TURN:
                     budget_exhausted = True
-                    result = ToolResultMessage(
-                        call.call_id,
-                        call.name,
-                        AbortedToolResult(
-                            outcome="TURN_ABORTED",
-                            reason="tool_call_budget_exhausted",
-                            resolution="Wait for a new customer turn before using another tool.",
-                        ),
+                    result = _aborted_tool_result(
+                        call,
+                        "tool_call_budget_exhausted",
                     )
                 else:
                     tool_calls += 1
