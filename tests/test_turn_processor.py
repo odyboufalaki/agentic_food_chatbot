@@ -879,3 +879,77 @@ def test_model_failure_after_addition_reports_partial_success_and_canonical_draf
         ("L1", "fries", 350),
     ]
     assert session.revision == 1
+
+
+def test_customer_remedy_blocks_guessed_tool_retry_until_another_customer_turn() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="missing-flavor",
+            name="add_item",
+            arguments={"item_id": "milkshake", "quantity": 1},
+        ),)),
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="guessed-flavor",
+            name="add_item",
+            arguments={
+                "item_id": "milkshake",
+                "quantity": 1,
+                "options": {"flavor": "vanilla"},
+            },
+        ),)),
+        AssistantMessage(content="This response must not be requested."),
+    )
+    session = Session()
+
+    response = TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Add a milkshake",
+    )
+
+    assert response == {
+        "message": "I couldn't finish that request safely. Your draft is unchanged. Please try again.",
+    }
+    assert len(model.requests) == 2
+    results = [
+        message for message in session.transcript[0].messages
+        if isinstance(message, ToolResultMessage)
+    ]
+    assert _payload(results[0])["outcome"] == "INCOMPLETE"
+    assert _payload(results[1]) == {
+        "error": "turn_aborted",
+        "reason": "customer_input_required",
+        "resolution": "Wait for a new customer turn before using another tool.",
+    }
+    assert session.lines == []
+    assert session.revision == 0
+
+
+def test_menu_extra_cannot_bypass_validation_through_item_instructions() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="hidden-extra",
+            name="add_item",
+            arguments={
+                "item_id": "classic_burger",
+                "quantity": 1,
+                "instructions": "add bacon",
+            },
+        ),)),
+        AssistantMessage(content="Bacon needs to be selected as an Extra."),
+    )
+    session = Session()
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "Add a burger and put bacon on it",
+    )
+
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    payload = _payload(result)
+    assert payload["outcome"] == "UNSATISFIABLE"
+    assert payload["key"] == "instructions"
+    assert [alternative["value"] for alternative in payload["alternatives"]] == [
+        "cheese", "bacon", "avocado", "extra_patty",
+    ]
+    assert session.lines == []
+    assert session.revision == 0
+    assert session.next_line_number == 1

@@ -1,7 +1,9 @@
 """Pure validators for typed Draft order operations."""
 
-from food_ordering.menu import ALIASES, Menu
-from food_ordering.order import OrderLine
+import re
+
+from food_ordering.menu import Menu
+from food_ordering.order import AddSelectionIssue, OrderLine, normalize_add_selection
 from food_ordering.tool_protocol import (
     AddItem,
     Alternative,
@@ -15,7 +17,10 @@ from food_ordering.tool_protocol import (
 
 
 def _alternatives(values: list[tuple[str, str]]) -> list[Alternative]:
-    return [Alternative(value=value, label=label) for value, label in values]
+    return [
+        Alternative(value=value, label=label.replace("_", " "))
+        for value, label in values
+    ]
 
 
 def validate_add_item(
@@ -25,9 +30,9 @@ def validate_add_item(
 ) -> ValidationOutcome:
     """Validate one addition against a Draft candidate without mutating Session."""
 
-    item_id = ALIASES.get(operation.item_id, operation.item_id)
-    item = next((candidate for candidate in menu.menu if candidate.id == item_id), None)
-    if item is None:
+    line_id = f"L{draft.next_line_number}"
+    normalized = normalize_add_selection(operation, menu, line_id=line_id)
+    if isinstance(normalized, AddSelectionIssue) and normalized.kind == "item":
         return Unsatisfiable(
             outcome="UNSATISFIABLE",
             remedy="change_request",
@@ -39,85 +44,91 @@ def validate_add_item(
                 (candidate.id, candidate.name) for candidate in menu.menu
             ]),
         )
-
-    unsupported_option = next(
-        (name for name in operation.options if name not in item.options),
-        None,
-    )
-    if unsupported_option is not None:
+    if isinstance(normalized, AddSelectionIssue) and normalized.kind == "option_name":
         return Unsatisfiable(
             outcome="UNSATISFIABLE",
             remedy="change_request",
-            reason=f"{item.name} does not support the {unsupported_option} option.",
-            resolution=f"Choose a supported option for {item.name}.",
-            subject=item.name,
-            key=unsupported_option,
-            alternatives=_alternatives([(name, name) for name in item.options]),
+            reason=f"{normalized.item_name} does not support the {normalized.key} option.",
+            resolution=f"Choose a supported option for {normalized.item_name}.",
+            subject=normalized.item_name,
+            key=normalized.key,
+            alternatives=_alternatives([(name, name) for name in normalized.alternatives]),
         )
-
-    normalized_options: dict[str, str] = {}
-    unit_cents = item.base_price
-    for name, option in item.options.items():
-        value = operation.options.get(name, option.default)
-        if value is None:
-            if option.required:
-                return Incomplete(
-                    outcome="INCOMPLETE",
-                    remedy="ask_customer",
-                    reason=f"{item.name} requires a {name}.",
-                    resolution=f"Ask the customer to choose a {name}.",
-                    subject=item.name,
-                    key=name,
-                    alternatives=_alternatives([(choice, choice) for choice in option.choices]),
-                )
-            continue
-        if value not in option.choices:
-            return Incomplete(
-                outcome="INCOMPLETE",
-                remedy="ask_customer",
-                reason=f"{value} is not a supported {name} for {item.name}.",
-                resolution=f"Ask the customer to choose a supported {name}.",
-                subject=item.name,
-                key=name,
-                alternatives=_alternatives([(choice, choice) for choice in option.choices]),
+    if isinstance(normalized, AddSelectionIssue) and normalized.kind in {
+        "required_option", "option_value",
+    }:
+        assert normalized.key is not None
+        reason = (
+            f"{normalized.item_name} requires a {normalized.key}."
+            if normalized.kind == "required_option"
+            else (
+                f"{normalized.value} is not a supported {normalized.key} "
+                f"for {normalized.item_name}."
             )
-        normalized_options[name] = value
-        unit_cents += option.price_modifier.get(value, 0)
-
-    extra_prices = {extra.id: extra.price for extra in item.extras.choices}
-    unsupported_extra = next(
-        (extra for extra in operation.extras if extra not in extra_prices),
-        None,
-    )
-    if unsupported_extra is not None:
+        )
+        return Incomplete(
+            outcome="INCOMPLETE",
+            remedy="ask_customer",
+            reason=reason,
+            resolution=(
+                f"Ask the customer to choose a {normalized.key}."
+                if normalized.kind == "required_option"
+                else f"Ask the customer to choose a supported {normalized.key}."
+            ),
+            subject=normalized.item_name,
+            key=normalized.key,
+            alternatives=_alternatives([
+                (choice, choice) for choice in normalized.alternatives
+            ]),
+        )
+    if isinstance(normalized, AddSelectionIssue):
         return Unsatisfiable(
             outcome="UNSATISFIABLE",
             remedy="change_request",
-            reason=f"{item.name} does not support the {unsupported_extra} extra.",
-            resolution=f"Choose a supported extra for {item.name}.",
-            subject=item.name,
+            reason=f"{normalized.item_name} does not support the {normalized.value} extra.",
+            resolution=f"Choose a supported extra for {normalized.item_name}.",
+            subject=normalized.item_name,
             key="extras",
             alternatives=_alternatives([
-                (extra.id, extra.id) for extra in item.extras.choices
+                (extra, extra) for extra in normalized.alternatives
             ]),
         )
 
-    extras = tuple(sorted(set(operation.extras)))
-    unit_cents += sum(extra_prices[extra] for extra in extras)
-    line_id = f"L{draft.next_line_number}"
-    line = OrderLine(
-        item_id=item.id,
-        name=item.name,
-        quantity=operation.quantity,
-        options=tuple(normalized_options.items()),
-        extras=extras,
-        unit_cents=unit_cents,
-        line_id=line_id,
-        instructions=operation.instructions.strip(),
+    assert isinstance(normalized, OrderLine)
+    instruction_text = normalized.instructions.casefold().replace("_", " ")
+    selected_extras = set(normalized.extras)
+    named_unselected_extra = next(
+        (
+            extra.id
+            for menu_item in menu.menu
+            for extra in menu_item.extras.choices
+            if extra.id not in selected_extras
+            and re.search(
+                rf"(?<!\w){re.escape(extra.id.casefold().replace('_', ' '))}(?!\w)",
+                instruction_text,
+            )
+        ),
+        None,
     )
+    if named_unselected_extra is not None:
+        supported_extras = next(
+            item.extras.choices for item in menu.menu if item.id == normalized.item_id
+        )
+        return Unsatisfiable(
+            outcome="UNSATISFIABLE",
+            remedy="change_request",
+            reason="A Menu Extra cannot be added through Special instructions.",
+            resolution="Select the Extra explicitly when it is supported by the item.",
+            subject=normalized.name,
+            key="instructions",
+            alternatives=_alternatives([
+                (extra.id, extra.id) for extra in supported_extras
+            ]),
+            note=f"Instruction named the unselected Extra {named_unselected_extra}.",
+        )
     return Valid(
         candidate=DraftState(
-            lines=(*draft.lines, line),
+            lines=(*draft.lines, normalized),
             general_instructions=draft.general_instructions,
             next_line_number=draft.next_line_number + 1,
         ),

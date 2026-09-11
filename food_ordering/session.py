@@ -6,6 +6,7 @@ from uuid import uuid4
 from food_ordering.model_adapter import TranscriptTurn
 from food_ordering.order import ClarificationContext, OrderLine
 from food_ordering.proposals import Proposal
+from food_ordering.tool_protocol import DraftState
 
 
 OrderStatus = Literal["draft", "submitted", "rejected", "application_error", "uncertain"]
@@ -51,3 +52,17 @@ class Session:
     application_error_payload: dict[str, Any] | None = None
     retry_requires_review: bool = False
     pending_change: PendingChange | None = None
+
+    def commit_draft(self, candidate: DraftState) -> None:
+        """Commit one changed Draft candidate and invalidate stale checkout state."""
+
+        self.lines = list(candidate.lines)
+        self.instructions = candidate.general_instructions
+        self.next_line_number = candidate.next_line_number
+        self.revision += 1
+        self.reviewed_revision = None
+        self.status = "draft"
+        self.receipt_message = ""
+        self.rejected_payload = None
+        self.application_error_payload = None
+        self.retry_requires_review = False

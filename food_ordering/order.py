@@ -1,5 +1,5 @@
 from dataclasses import dataclass, replace
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 from food_ordering.menu import ALIASES, Menu, money
 from food_ordering.proposals import Add, ChangeQuantity, Edit, Target
@@ -54,6 +54,30 @@ class ClarificationNeeded(InvalidSelection):
     def __init__(self, context: ClarificationContext) -> None:
         self.context = context
         super().__init__(context.fallback_question)
+
+
+class AddSelection(Protocol):
+    item_id: str
+    quantity: int
+    options: dict[str, str]
+    extras: list[str]
+    instructions: str
+
+
+@dataclass(frozen=True)
+class AddSelectionIssue:
+    kind: Literal[
+        "item",
+        "option_name",
+        "required_option",
+        "option_value",
+        "extra",
+    ]
+    item_id: str
+    item_name: str | None = None
+    key: str | None = None
+    value: str | None = None
+    alternatives: tuple[str, ...] = ()
 
 
 def build_clarification_context(
@@ -121,36 +145,96 @@ class OrderLine:
         }
 
 
-def normalize(selection: Add, menu: Menu, *, line_id: str) -> OrderLine:
+def normalize_add_selection(
+    selection: AddSelection,
+    menu: Menu,
+    *,
+    line_id: str,
+) -> OrderLine | AddSelectionIssue:
     item_id = ALIASES.get(selection.item_id, selection.item_id)
     item = next((item for item in menu.menu if item.id == item_id), None)
     if item is None:
-        raise InvalidSelection("That item is not on the menu. Please choose a listed item.")
-    if not selection.options.keys() <= item.options.keys():
-        raise InvalidSelection(f"Unsupported option for {item.name}. Please check the menu.")
+        return AddSelectionIssue(kind="item", item_id=selection.item_id)
+    unsupported_option = next(
+        (name for name in selection.options if name not in item.options),
+        None,
+    )
+    if unsupported_option is not None:
+        return AddSelectionIssue(
+            kind="option_name",
+            item_id=item.id,
+            item_name=item.name,
+            key=unsupported_option,
+            alternatives=tuple(item.options),
+        )
     options = {}
     price = item.base_price
     for name, option in item.options.items():
         value = selection.options.get(name, option.default)
         if value is None:
             if option.required:
-                raise ClarificationNeeded(ClarificationContext(
-                    reason="required_option",
-                    fallback_question=f"Choose {name} for {item.name}: {', '.join(option.choices)}.",
-                    subject=item.name, field=name, choices=tuple(option.choices),
-                ))
+                return AddSelectionIssue(
+                    kind="required_option",
+                    item_id=item.id,
+                    item_name=item.name,
+                    key=name,
+                    alternatives=tuple(option.choices),
+                )
             continue
         if value not in option.choices:
-            raise InvalidSelection(f"Choose a supported {name} for {item.name}: {', '.join(option.choices)}.")
+            return AddSelectionIssue(
+                kind="option_value",
+                item_id=item.id,
+                item_name=item.name,
+                key=name,
+                value=value,
+                alternatives=tuple(option.choices),
+            )
         options[name] = value
         price += option.price_modifier.get(value, 0)
     extra_prices = {extra.id: extra.price for extra in item.extras.choices}
     extras = tuple(sorted(set(selection.extras)))
     if not set(extras) <= extra_prices.keys():
-        raise InvalidSelection(f"Unsupported extra for {item.name}. Please choose a listed extra.")
+        unsupported_extra = next(extra for extra in extras if extra not in extra_prices)
+        return AddSelectionIssue(
+            kind="extra",
+            item_id=item.id,
+            item_name=item.name,
+            value=unsupported_extra,
+            alternatives=tuple(extra_prices),
+        )
     price += sum(extra_prices[extra] for extra in extras)
     return OrderLine(item.id, item.name, selection.quantity, tuple(options.items()), extras, price,
                      line_id, selection.instructions.strip())
+
+
+def normalize(selection: Add, menu: Menu, *, line_id: str) -> OrderLine:
+    result = normalize_add_selection(selection, menu, line_id=line_id)
+    if isinstance(result, OrderLine):
+        return result
+    if result.kind == "item":
+        raise InvalidSelection("That item is not on the menu. Please choose a listed item.")
+    if result.kind == "option_name":
+        raise InvalidSelection(f"Unsupported option for {result.item_name}. Please check the menu.")
+    if result.kind == "required_option":
+        key = result.key or "required option"
+        raise ClarificationNeeded(ClarificationContext(
+            reason="required_option",
+            fallback_question=(
+                f"Choose {key} for {result.item_name}: {', '.join(result.alternatives)}."
+            ),
+            subject=result.item_name,
+            field=result.key,
+            choices=result.alternatives,
+        ))
+    if result.kind == "option_value":
+        raise InvalidSelection(
+            f"Choose a supported {result.key} for {result.item_name}: "
+            f"{', '.join(result.alternatives)}."
+        )
+    raise InvalidSelection(
+        f"Unsupported extra for {result.item_name}. Please choose a listed extra."
+    )
 
 
 def matching_lines(target: Target, lines: list[OrderLine]) -> list[OrderLine]:

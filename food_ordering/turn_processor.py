@@ -1,7 +1,7 @@
 """Bounded, provider-neutral orchestration for one customer turn."""
 
-from food_ordering.menu import Menu
 from food_ordering.draft_operations import validate_add_item
+from food_ordering.menu import Menu
 from food_ordering.model_adapter import (
     AbortReason,
     AbortedToolResult,
@@ -166,7 +166,7 @@ def _aborted_tool_result(
 
 
 class TurnProcessor:
-    """Run one read-only model/tool/result loop."""
+    """Run one bounded model/tool/result loop for a customer turn."""
 
     def __init__(self, *, model: TurnModel, menu: Menu, session: Session) -> None:
         self._model = model
@@ -186,6 +186,7 @@ class TurnProcessor:
         tool_calls = 0
         violations: set[tuple[str, str | None, str | None]] = set()
         processed_calls: dict[str, tuple[ToolCall, ToolResultMessage]] = {}
+        customer_input_required = False
 
         while True:
             try:
@@ -198,6 +199,14 @@ class TurnProcessor:
                     current_turn.append(_aborted_tool_result(
                         call,
                         "model_response_truncated",
+                    ))
+                return self._fallback(current_turn, starting_revision)
+            if customer_input_required and response.tool_calls:
+                current_turn.append(response)
+                for call in response.tool_calls:
+                    current_turn.append(_aborted_tool_result(
+                        call,
+                        "customer_input_required",
                     ))
                 return self._fallback(current_turn, starting_revision)
             current_turn.append(response)
@@ -238,6 +247,7 @@ class TurnProcessor:
                     malformed_calls += 1
                 fingerprint = _violation_fingerprint(result.payload)
                 if fingerprint is not None:
+                    customer_input_required = True
                     if fingerprint in violations:
                         repeated_violation = True
                     violations.add(fingerprint)
@@ -347,16 +357,7 @@ class TurnProcessor:
             )
             if not isinstance(validation, Valid):
                 return ToolResultMessage(call.call_id, call.name, validation)
-            self._session.lines = list(validation.candidate.lines)
-            self._session.instructions = validation.candidate.general_instructions
-            self._session.next_line_number = validation.candidate.next_line_number
-            self._session.revision += 1
-            self._session.reviewed_revision = None
-            self._session.status = "draft"
-            self._session.receipt_message = ""
-            self._session.rejected_payload = None
-            self._session.application_error_payload = None
-            self._session.retry_requires_review = False
+            self._session.commit_draft(validation.candidate)
             payload = AppliedPayload(
                 outcome="APPLIED",
                 effect=AppliedEffect(
@@ -371,8 +372,8 @@ class TurnProcessor:
         payload = Unsatisfiable(
             outcome="UNSATISFIABLE",
             remedy="change_request",
-            reason="That operation is unavailable in the read-only processor.",
-            resolution="Use show_menu or show_draft, or wait for mutation support.",
+            reason="That operation is unavailable in this processor version.",
+            resolution="Use show_menu, show_draft, or add_item.",
             subject=call.name,
         )
         return ToolResultMessage(call.call_id, call.name, payload)

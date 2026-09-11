@@ -27,6 +27,7 @@ class AssistantMessage:
 
 
 AbortReason: TypeAlias = Literal[
+    "customer_input_required",
     "model_response_truncated",
     "tool_call_budget_exhausted",
 ]
