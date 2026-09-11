@@ -26,6 +26,9 @@ EXPECTED_TOOL_NAMES = [
     "remove_item",
     "clear_draft",
     "set_order_instructions",
+    "start_new_order",
+    "propose_submission",
+    "submit_order",
 ]
 
 
@@ -222,6 +225,33 @@ def test_malformed_call_is_returned_for_one_blind_correction() -> None:
     assert isinstance(corrected, ToolResultMessage)
     assert corrected.call_id == "fixed-1"
     assert _payload(corrected)["outcome"] == "RESULT"
+
+
+def test_tool_call_without_an_id_is_rejected_before_draft_mutation() -> None:
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="",
+            name="add_item",
+            arguments={"item_id": "fries", "quantity": 1},
+        ),)),
+        AssistantMessage(content="Please let me try that again."),
+    )
+    session = Session()
+
+    TurnProcessor(model=model, menu=load_menu(), session=session).process("Add fries")
+
+    assert session.lines == []
+    assert session.revision == 0
+    result = model.requests[1][-1]
+    assert isinstance(result, ToolResultMessage)
+    assert _payload(result) == {
+        "outcome": "MALFORMED",
+        "remedy": "correct_tool",
+        "reason": "The tool call is missing its required call ID.",
+        "resolution": "Return the tool call again with a non-empty call ID.",
+        "tool_name": "add_item",
+        "issues": [{"path": ["call_id"], "message": "Call ID must be a non-empty string"}],
+    }
 
 
 def test_exhausted_malformed_correction_budget_uses_customer_safe_fallback() -> None:

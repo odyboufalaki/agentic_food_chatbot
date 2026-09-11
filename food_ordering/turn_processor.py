@@ -76,6 +76,9 @@ def _tool_specs() -> tuple[ToolSpec, ...]:
         "remove_item": "Remove one uniquely identified selection from the Draft order.",
         "clear_draft": "Clear all selections and general instructions from the Draft order.",
         "set_order_instructions": "Set, replace, or clear general Draft-order instructions.",
+        "start_new_order": "Start a new Draft after a completed order.",
+        "propose_submission": "Present the current Draft for customer review.",
+        "submit_order": "Submit an unchanged reviewed order after customer confirmation.",
     }
     return tuple(
         ToolSpec(name=name, parameters=schemas[name], description=description)
@@ -326,6 +329,22 @@ class TurnProcessor:
         return ToolResultMessage(call.call_id, call.name, previous_result.payload)
 
     def _dispatch(self, call: ToolCall) -> ToolResultMessage:
+        if not call.call_id.strip():
+            return ToolResultMessage(
+                call.call_id,
+                call.name,
+                Malformed(
+                    outcome="MALFORMED",
+                    remedy="correct_tool",
+                    reason="The tool call is missing its required call ID.",
+                    resolution="Return the tool call again with a non-empty call ID.",
+                    tool_name=call.name,
+                    issues=[SchemaIssue(
+                        path=["call_id"],
+                        message="Call ID must be a non-empty string",
+                    )],
+                ),
+            )
         operation = parse_tool_call(call.name, call.arguments)
         if isinstance(operation, Malformed):
             return ToolResultMessage(
