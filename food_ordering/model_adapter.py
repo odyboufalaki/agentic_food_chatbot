@@ -4,7 +4,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeAlias
 
-from food_ordering.tool_protocol import ModelResult, StrictModel, SubmissionResult
+from food_ordering.models import StrictModel
+from food_ordering.tool_protocol import ModelResult, SubmissionResult
 
 
 @dataclass(frozen=True)

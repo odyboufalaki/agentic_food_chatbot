@@ -1,12 +1,12 @@
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Literal, Self
 
 import yaml
 from pydantic import BeforeValidator, Field, model_validator
 
-from food_ordering.proposals import StrictModel
+from food_ordering.models import StrictModel
 
 
 def cents(value: object) -> int:
@@ -101,12 +101,6 @@ def load_menu() -> Menu:
 
 
 ALIASES = {"burger": "classic_burger", "cola": "soda", "pizza": "margherita"}
-
-
-def menu_context(menu: Menu) -> dict[str, Any]:
-    return {"prices_in": "integer cents", "items": menu.model_dump()["menu"], "aliases": dict(ALIASES)}
-
-
 def money(value: int) -> str:
     sign = "-" if value < 0 else ""
     return f"{sign}${abs(value) // 100}.{abs(value) % 100:02d}"

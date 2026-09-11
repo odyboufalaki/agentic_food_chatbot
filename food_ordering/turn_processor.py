@@ -670,8 +670,6 @@ class TurnProcessor:
             self._session.status = "draft"
             self._session.submission_outcome = None
             self._session.last_submission_attempt_turn = None
-            self._session.rejected_payload = None
-            self._session.application_error_payload = None
             return ToolResultMessage(
                 call.call_id,
                 call.name,
@@ -853,7 +851,6 @@ class TurnProcessor:
             )
             self._session.status = "rejected"
             self._session.submission_outcome = rejected
-            self._session.rejected_payload = frozen_payload
             return ToolResultMessage(call.call_id, call.name, rejected)
         if outcome.status == "application_error":
             application_error = ApplicationErrorPayload(
@@ -864,7 +861,6 @@ class TurnProcessor:
             )
             self._session.status = "application_error"
             self._session.submission_outcome = application_error
-            self._session.application_error_payload = frozen_payload
             self._session.invalidate_review()
             return ToolResultMessage(call.call_id, call.name, application_error)
         if outcome.status == "not_sent":

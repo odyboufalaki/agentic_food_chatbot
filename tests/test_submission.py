@@ -5,8 +5,7 @@ import httpx
 import pytest
 
 from food_ordering.menu import Menu
-from food_ordering.order import InvalidSelection, normalize, submission_payload
-from food_ordering.proposals import Add
+from food_ordering.order import InvalidSelection, OrderLine, submission_payload
 from food_ordering.submission import MCPSubmitter, SubmissionSettings
 
 
@@ -164,9 +163,13 @@ def test_submission_payload_rejects_fifty_dollars_and_one_cent() -> None:
             "options": {},
         }],
     })
-    line = normalize(
-        Add(type="add", item_id="boundary_item", quantity=1),
-        menu,
+    line = OrderLine(
+        item_id="boundary_item",
+        name="Boundary item",
+        quantity=1,
+        options=(),
+        extras=(),
+        unit_cents=5001,
         line_id="L1",
     )
 

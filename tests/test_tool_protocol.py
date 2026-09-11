@@ -39,7 +39,6 @@ from food_ordering.tool_protocol import (
     ShowMenu,
     StartNewOrder,
     StoredLineSnapshot,
-    StrictModel,
     SubmitOrder,
     SubmittedPayload,
     TOOL_PROTOCOL_VERSION,
@@ -53,6 +52,7 @@ from food_ordering.tool_protocol import (
     validate_model_result,
     validate_submission_result,
 )
+from food_ordering.models import StrictModel
 from food_ordering.order import OrderLine
 
 
@@ -461,7 +461,7 @@ def test_review_snapshot_freezes_python_owned_review_and_restaurant_payload() ->
     }
 
 
-def test_forbidden_migration_fields_are_absent_from_the_parallel_contract() -> None:
+def test_forbidden_migration_fields_are_absent_from_the_production_contract() -> None:
     schema_text = json.dumps(protocol_schema(), sort_keys=True)
 
     for forbidden in (

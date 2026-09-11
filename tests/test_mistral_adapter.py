@@ -6,9 +6,9 @@ import httpx
 import pytest
 from mistralai.client import Mistral
 
-from food_ordering.interpretation import ModelFailure
 from food_ordering.menu import load_menu
 from food_ordering.mistral_adapter import MistralToolModel
+from food_ordering.mistral_support import ModelFailure
 from food_ordering.model_adapter import (
     AssistantMessage,
     CustomerMessage,

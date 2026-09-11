@@ -1775,7 +1775,6 @@ def test_flavor_answer_reconstructs_a_fresh_add_without_duplicating_prior_succes
     ]
     assert session.revision == 2
     assert session.next_line_number == 3
-    assert session.pending_change is None
 
 
 @pytest.mark.parametrize(

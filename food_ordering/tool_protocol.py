@@ -1,24 +1,20 @@
 """Version 1 model-tool and outcome contract.
 
-This module is deliberately independent of the production conversation path. It
-defines the parallel protocol that later migration tickets can connect to
-deterministic validators and turn orchestration.
+This module defines the production protocol shared by schemas, parsing,
+deterministic validators, orchestration, and logs.
 """
 
 from dataclasses import dataclass, field
 import json
 from typing import Annotated, Any, Literal, Self, TypeAlias, cast
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, model_validator
+from pydantic import Field, TypeAdapter, ValidationError, model_validator
 
+from food_ordering.models import StrictModel
 from food_ordering.order import OrderLine
 
 
 TOOL_PROTOCOL_VERSION = 1
-
-
-class StrictModel(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
 
 
 class LineTarget(StrictModel):

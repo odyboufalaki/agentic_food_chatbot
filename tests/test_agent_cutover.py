@@ -42,7 +42,6 @@ def test_send_uses_the_outcome_driven_turn_processor(tmp_path) -> None:
     assert "Which milkshake flavor" in response["message"]
     assert "1 × Classic Burger" in response["message"]
     assert [line.item_id for line in session.lines] == ["classic_burger"]
-    assert session.pending_change is None
 
     record = json.loads((tmp_path / "turns.jsonl").read_text())
     assert record["tool_protocol_version"] == 1
@@ -145,7 +144,6 @@ def test_send_reconstructs_clarification_from_the_transcript(tmp_path) -> None:
     assert first == {"message": "Which flavor would you like?"}
     assert "Milkshake" in second["message"] and "flavor: oreo" in second["message"]
     assert len(model.requests[2]) == 5
-    assert session.pending_change is None
 
 
 def test_send_handles_serving_split_ambiguity_and_clean_replacement(tmp_path) -> None:
