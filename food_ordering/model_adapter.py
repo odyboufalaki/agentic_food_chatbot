@@ -4,7 +4,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol, TypeAlias
 
-from food_ordering.tool_protocol import ModelResult
+from food_ordering.tool_protocol import ModelResult, StrictModel
 
 
 @dataclass(frozen=True)
@@ -26,11 +26,22 @@ class AssistantMessage:
     completion_status: Literal["complete", "truncated"] = "complete"
 
 
+class AbortedToolResult(StrictModel):
+    """Orchestration result for an emitted call that was not dispatched."""
+
+    outcome: Literal["TURN_ABORTED"]
+    reason: Literal["model_response_truncated", "tool_call_budget_exhausted"]
+    resolution: str
+
+
+ToolResultPayload: TypeAlias = ModelResult | AbortedToolResult
+
+
 @dataclass(frozen=True)
 class ToolResultMessage:
     call_id: str
     name: str
-    payload: ModelResult
+    payload: ToolResultPayload
 
 
 ModelMessage: TypeAlias = CustomerMessage | AssistantMessage | ToolResultMessage

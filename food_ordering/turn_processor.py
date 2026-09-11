@@ -2,6 +2,7 @@
 
 from food_ordering.menu import Menu
 from food_ordering.model_adapter import (
+    AbortedToolResult,
     AssistantMessage,
     CustomerMessage,
     ModelMessage,
@@ -130,7 +131,7 @@ def _draft_snapshot(session: Session) -> DraftSnapshot:
 
 
 def _violation_fingerprint(
-    payload: ModelResult,
+    payload: ModelResult | AbortedToolResult,
 ) -> tuple[str, str | None, str | None] | None:
     if isinstance(payload, (Incomplete, Unsatisfiable)):
         return payload.outcome, payload.subject, payload.key
@@ -165,8 +166,17 @@ class TurnProcessor:
             except Exception:
                 return self._fallback(current_turn)
             if response.completion_status == "truncated":
-                return self._fallback(current_turn)
-            if len(response.tool_calls) > MAX_TOOL_CALLS_PER_TURN - tool_calls:
+                current_turn.append(response)
+                for call in response.tool_calls:
+                    current_turn.append(ToolResultMessage(
+                        call.call_id,
+                        call.name,
+                        AbortedToolResult(
+                            outcome="TURN_ABORTED",
+                            reason="model_response_truncated",
+                            resolution="Wait for a new customer turn before using another tool.",
+                        ),
+                    ))
                 return self._fallback(current_turn)
             current_turn.append(response)
             messages.append(response)
@@ -176,10 +186,23 @@ class TurnProcessor:
                     return {"message": response.content}
                 return self._fallback(current_turn)
 
+            budget_exhausted = False
             repeated_violation = False
             for call in response.tool_calls:
-                tool_calls += 1
-                result = self._dispatch(call)
+                if tool_calls >= MAX_TOOL_CALLS_PER_TURN:
+                    budget_exhausted = True
+                    result = ToolResultMessage(
+                        call.call_id,
+                        call.name,
+                        AbortedToolResult(
+                            outcome="TURN_ABORTED",
+                            reason="tool_call_budget_exhausted",
+                            resolution="Wait for a new customer turn before using another tool.",
+                        ),
+                    )
+                else:
+                    tool_calls += 1
+                    result = self._dispatch(call)
                 current_turn.append(result)
                 messages.append(result)
                 if isinstance(result.payload, Malformed):
@@ -190,7 +213,8 @@ class TurnProcessor:
                         repeated_violation = True
                     violations.add(fingerprint)
             if (
-                repeated_violation
+                budget_exhausted
+                or repeated_violation
                 or malformed_calls > MAX_MALFORMED_CORRECTIONS
             ):
                 return self._fallback(current_turn)
