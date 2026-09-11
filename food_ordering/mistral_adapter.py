@@ -2,14 +2,19 @@
 
 import json
 from collections.abc import Mapping, Sequence
-from contextlib import nullcontext
 from typing import Any, Literal
 
 import httpx
 from mistralai.client import Mistral, models
 from mistralai.client.errors import MistralError, ResponseValidationError
 
-from food_ordering.interpretation import ModelFailure, Settings
+from food_ordering.mistral_support import (
+    ModelFailure,
+    Settings,
+    client_context,
+    error_category,
+    validate_configuration,
+)
 from food_ordering.model_adapter import (
     AssistantMessage,
     CustomerMessage,
@@ -55,12 +60,7 @@ class MistralToolModel:
             ))
             for tool in tools
         ]
-        client_context = nullcontext(self._client) if self._client is not None else Mistral(
-            api_key=self._settings.api_key,
-            retry_config=None,
-            timeout_ms=self._settings.timeout_ms,
-        )
-        with client_context as client:
+        with client_context(self._settings, self._client) as client:
             for attempt in range(2):
                 try:
                     response = client.chat.complete(
@@ -75,10 +75,12 @@ class MistralToolModel:
                         max_tokens=4096,
                     )
                     return self._assistant_message(response)
-                except (httpx.TimeoutException, httpx.TransportError):
+                except httpx.TimeoutException:
+                    category = "model_timeout"
+                except httpx.TransportError:
                     category = "model_unavailable"
                 except MistralError as error:
-                    category = self._mistral_error_category(error)
+                    category = error_category(error)
                     if category in {"authentication", "configuration", "model_error"}:
                         raise ModelFailure(category) from None
                 except (ResponseValidationError, ValueError, TypeError):
@@ -88,12 +90,7 @@ class MistralToolModel:
         raise ModelFailure("model_error")
 
     def _validate_configuration(self) -> None:
-        if (
-            not self._settings.model.strip()
-            or self._settings.timeout_ms <= 0
-            or (self._client is None and not (self._settings.api_key or "").strip())
-        ):
-            raise ModelFailure("configuration")
+        validate_configuration(self._settings, self._client)
 
     @staticmethod
     def _provider_messages(
@@ -160,7 +157,9 @@ class MistralToolModel:
             for call in (provider_message.tool_calls or [])
         )
         completion_status: Literal["complete", "truncated"] = (
-            "truncated" if choice.finish_reason == "length" else "complete"
+            "truncated"
+            if choice.finish_reason in {"length", "model_length", "error"}
+            else "complete"
         )
         return AssistantMessage(
             content=text,
@@ -176,15 +175,3 @@ class MistralToolModel:
             return json.loads(arguments)
         except json.JSONDecodeError:
             return arguments
-
-    @staticmethod
-    def _mistral_error_category(error: MistralError) -> str:
-        if error.status_code in {401, 403}:
-            return "authentication"
-        if error.status_code in {400, 404, 422}:
-            return "configuration"
-        if error.status_code == 429:
-            return "rate_limit"
-        if error.status_code in {408, 500, 502, 503, 504}:
-            return "model_unavailable"
-        return "model_error"

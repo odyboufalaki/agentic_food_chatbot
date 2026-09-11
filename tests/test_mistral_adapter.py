@@ -156,7 +156,7 @@ def test_multiple_unknown_and_malformed_calls_remain_observable_in_emitted_order
     [
         ([429, 429], 2, "rate_limit"),
         ([503, 503], 2, "model_unavailable"),
-        (["timeout", "timeout"], 2, "model_unavailable"),
+        (["timeout", "timeout"], 2, "model_timeout"),
         ([401], 1, "authentication"),
         ([422], 1, "configuration"),
     ],
@@ -189,7 +189,10 @@ def test_only_transient_provider_failures_receive_one_bounded_retry(
     assert calls == expected_calls
 
 
-def test_length_limited_response_is_reported_as_truncated_with_its_calls() -> None:
+@pytest.mark.parametrize("finish_reason", ["length", "model_length", "error"])
+def test_incomplete_response_is_reported_as_truncated_with_its_calls(
+    finish_reason: str,
+) -> None:
     def handle(request: httpx.Request) -> httpx.Response:
         return _completion(
             content="I only decoded part of this.",
@@ -198,7 +201,7 @@ def test_length_limited_response_is_reported_as_truncated_with_its_calls() -> No
                 "type": "function",
                 "function": {"name": "add_item", "arguments": '{"item_id":"fries"}'},
             }],
-            finish_reason="length",
+            finish_reason=finish_reason,
         )
 
     observed: list[AssistantMessage] = []

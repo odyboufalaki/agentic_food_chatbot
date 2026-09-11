@@ -1,5 +1,7 @@
 """Bounded, provider-neutral orchestration for one customer turn."""
 
+from collections.abc import Callable
+
 from food_ordering.draft_operations import (
     validate_add_item,
     validate_change_quantity,
@@ -43,6 +45,7 @@ from food_ordering.tool_protocol import (
     MenuSnapshot,
     Malformed,
     ModelResult,
+    Operation,
     ResultPayload,
     RemoveItem,
     SchemaIssue,
@@ -76,7 +79,7 @@ def _tool_specs() -> tuple[ToolSpec, ...]:
         "remove_item": "Remove one uniquely identified selection from the Draft order.",
         "clear_draft": "Clear all selections and general instructions from the Draft order.",
         "set_order_instructions": "Set, replace, or clear general Draft-order instructions.",
-        "start_new_order": "Start a new Draft after a completed order.",
+        "start_new_order": "Start a new Draft after a Submitted order.",
         "propose_submission": "Present the current Draft for customer review.",
         "submit_order": "Submit an unchanged reviewed order after customer confirmation.",
     }
@@ -189,10 +192,18 @@ def _aborted_tool_result(
 class TurnProcessor:
     """Run one bounded model/tool/result loop for a customer turn."""
 
-    def __init__(self, *, model: TurnModel, menu: Menu, session: Session) -> None:
+    def __init__(
+        self,
+        *,
+        model: TurnModel,
+        menu: Menu,
+        session: Session,
+        operation_observer: Callable[[ToolCall, Operation], None] | None = None,
+    ) -> None:
         self._model = model
         self._menu = menu
         self._session = session
+        self._operation_observer = operation_observer
 
     def process(self, customer_message: str) -> dict[str, str]:
         starting_revision = self._session.revision
@@ -352,6 +363,11 @@ class TurnProcessor:
                 call.name,
                 operation,
             )
+        if self._operation_observer is not None:
+            try:
+                self._operation_observer(call, operation)
+            except Exception:
+                pass
         if isinstance(operation, ShowMenu):
             available_ids = {item.id for item in self._menu.menu}
             unknown = next(

@@ -1,7 +1,4 @@
 import json
-import os
-from contextlib import nullcontext
-from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import httpx
@@ -9,20 +6,15 @@ from mistralai.client import Mistral, models
 from mistralai.client.errors import MistralError, ResponseValidationError
 from pydantic import ValidationError
 
+from food_ordering.mistral_support import (
+    ModelFailure as ModelFailure,
+    Settings as Settings,
+    client_context,
+    error_category,
+    validate_configuration,
+)
 from food_ordering.order import ClarificationContext, ResponseContext
 from food_ordering.proposals import Proposal
-
-
-@dataclass(frozen=True)
-class Settings:
-    api_key: str | None = field(default=None, repr=False)
-    model: str = "mistral-small-latest"
-    timeout_ms: int = 20_000
-
-    @classmethod
-    def from_env(cls) -> "Settings":
-        return cls(api_key=os.getenv("MISTRAL_API_KEY"),
-                   model=os.getenv("MISTRAL_MODEL", "mistral-small-latest"))
 
 
 class Interpreter(Protocol):
@@ -50,12 +42,6 @@ class TemplateResponseRenderer:
 class TemplateClarificationRenderer:
     def render(self, clarification: ClarificationContext) -> str:
         return clarification.fallback_question
-
-
-class ModelFailure(Exception):
-    def __init__(self, category: str) -> None:
-        self.category = category
-        super().__init__(category)
 
 
 PROMPT = """Interpret a customer's latest food-order message as a JSON proposal.
@@ -359,9 +345,7 @@ class MistralInterpreter:
         order_state: dict[str, Any] | None = None,
         pending_clarification: dict[str, Any] | None = None,
     ) -> Proposal:
-        if (not self._settings.model.strip() or self._settings.timeout_ms <= 0
-                or (self._client is None and not (self._settings.api_key or "").strip())):
-            raise ModelFailure("configuration")
+        validate_configuration(self._settings, self._client)
         context = json.dumps({"menu": menu, "draft": draft, "pending_clarification": pending_clarification,
                               "order_state": order_state}, ensure_ascii=False)
         messages: list[models.ChatCompletionRequestMessage] = [
@@ -374,10 +358,7 @@ class MistralInterpreter:
             else:
                 messages.append(models.AssistantMessage(content=entry["content"]))
         messages.append(models.UserMessage(content=message))
-        client_context = nullcontext(self._client) if self._client is not None else Mistral(
-            api_key=self._settings.api_key, retry_config=None, timeout_ms=self._settings.timeout_ms,
-        )
-        with client_context as client:
+        with client_context(self._settings, self._client) as client:
             for attempt in range(2):
                 try:
                     response = client.chat.complete(
@@ -412,29 +393,20 @@ class MistralInterpreter:
                 except httpx.TransportError:
                     category = "model_unavailable"
                 except MistralError as error:
-                    if error.status_code in {401, 403}:
-                        raise ModelFailure("authentication") from None
-                    if error.status_code in {400, 404, 422}:
-                        raise ModelFailure("configuration") from None
-                    if error.status_code not in {408, 429, 500, 502, 503, 504}:
-                        raise ModelFailure("model_error") from None
-                    category = "rate_limit" if error.status_code == 429 else "model_unavailable"
+                    category = error_category(error)
+                    if category in {"authentication", "configuration", "model_error"}:
+                        raise ModelFailure(category) from None
                 if attempt == 1:
                     raise ModelFailure(category) from None
         raise ModelFailure("model_error")
 
     def render(self, clarification: ClarificationContext) -> str:
-        if (not self._settings.model.strip() or self._settings.timeout_ms <= 0
-                or (self._client is None and not (self._settings.api_key or "").strip())):
-            raise ModelFailure("configuration")
+        validate_configuration(self._settings, self._client)
         messages: list[models.ChatCompletionRequestMessage] = [
             models.SystemMessage(content=CLARIFICATION_RESPONSE_PROMPT),
             models.UserMessage(content=json.dumps(clarification.snapshot(), ensure_ascii=False)),
         ]
-        client_context = nullcontext(self._client) if self._client is not None else Mistral(
-            api_key=self._settings.api_key, retry_config=None, timeout_ms=self._settings.timeout_ms,
-        )
-        with client_context as client:
+        with client_context(self._settings, self._client) as client:
             response = client.chat.complete(
                 model=self._settings.model, messages=messages, temperature=0,
                 retries=None, timeout_ms=self._settings.timeout_ms, max_tokens=120,
@@ -447,17 +419,12 @@ class MistralInterpreter:
         return content.strip()
 
     def render_response(self, context: ResponseContext) -> str:
-        if (not self._settings.model.strip() or self._settings.timeout_ms <= 0
-                or (self._client is None and not (self._settings.api_key or "").strip())):
-            raise ModelFailure("configuration")
+        validate_configuration(self._settings, self._client)
         messages: list[models.ChatCompletionRequestMessage] = [
             models.SystemMessage(content=RESPONSE_PROMPT),
             models.UserMessage(content=json.dumps(context.snapshot(), ensure_ascii=False)),
         ]
-        client_context = nullcontext(self._client) if self._client is not None else Mistral(
-            api_key=self._settings.api_key, retry_config=None, timeout_ms=self._settings.timeout_ms,
-        )
-        with client_context as client:
+        with client_context(self._settings, self._client) as client:
             response = client.chat.complete(
                 model=self._settings.model, messages=messages, temperature=0,
                 retries=None, timeout_ms=self._settings.timeout_ms, max_tokens=80,

@@ -254,6 +254,38 @@ def test_tool_call_without_an_id_is_rejected_before_draft_mutation() -> None:
     }
 
 
+def test_validated_operation_is_observable_before_draft_mutation() -> None:
+    session = Session()
+    observed: list[tuple[ToolCall, object, int, list[OrderLine]]] = []
+
+    def observe(call: ToolCall, operation: object) -> None:
+        observed.append((call, operation, session.revision, list(session.lines)))
+
+    model = ScriptedModel(
+        AssistantMessage(tool_calls=(ToolCall(
+            call_id="add-fries",
+            name="add_item",
+            arguments={"item_id": "fries", "quantity": 1},
+        ),)),
+        AssistantMessage(content="I added the fries."),
+    )
+
+    TurnProcessor(
+        model=model,
+        menu=load_menu(),
+        session=session,
+        operation_observer=observe,
+    ).process("Add fries")
+
+    assert len(observed) == 1
+    call, operation, revision_at_observation, lines_at_observation = observed[0]
+    assert call.arguments == {"item_id": "fries", "quantity": 1}
+    assert getattr(operation, "item_id") == "fries"
+    assert revision_at_observation == 0
+    assert lines_at_observation == []
+    assert session.revision == 1
+
+
 def test_exhausted_malformed_correction_budget_uses_customer_safe_fallback() -> None:
     model = ScriptedModel(
         *(AssistantMessage(tool_calls=(
