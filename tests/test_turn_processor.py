@@ -17,6 +17,18 @@ from food_ordering.session import Session
 from food_ordering.turn_processor import TurnProcessor
 
 
+EXPECTED_TOOL_NAMES = [
+    "show_menu",
+    "show_draft",
+    "add_item",
+    "update_item",
+    "change_quantity",
+    "remove_item",
+    "clear_draft",
+    "set_order_instructions",
+]
+
+
 class ScriptedModel:
     def __init__(self, *responses: AssistantMessage) -> None:
         self._responses = iter(responses)
@@ -50,16 +62,7 @@ def test_model_can_read_menu_result_then_complete_a_natural_response() -> None:
     )
 
     assert response == {"message": "We have burgers, pizza, sides, drinks, and desserts."}
-    assert [tool.name for tool in model.tool_specs[0]] == [
-        "show_menu",
-        "show_draft",
-        "add_item",
-        "update_item",
-        "change_quantity",
-        "remove_item",
-        "clear_draft",
-        "set_order_instructions",
-    ]
+    assert [tool.name for tool in model.tool_specs[0]] == EXPECTED_TOOL_NAMES
     update_spec = next(tool for tool in model.tool_specs[0] if tool.name == "update_item")
     assert "ReplaceServings" in update_spec.parameters["$defs"]
     result = model.requests[1][-1]
@@ -683,16 +686,7 @@ def test_valid_burgers_commit_while_incomplete_milkshake_asks_for_flavor() -> No
         "2 × Classic Burger (size: regular, patty: beef) — $17.00\n"
         "Total: $17.00"
     )}
-    assert [tool.name for tool in model.tool_specs[0]] == [
-        "show_menu",
-        "show_draft",
-        "add_item",
-        "update_item",
-        "change_quantity",
-        "remove_item",
-        "clear_draft",
-        "set_order_instructions",
-    ]
+    assert [tool.name for tool in model.tool_specs[0]] == EXPECTED_TOOL_NAMES
     results = model.requests[1][-2:]
     assert all(isinstance(result, ToolResultMessage) for result in results)
     assert _payload(results[0]) == {
