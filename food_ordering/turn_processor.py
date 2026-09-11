@@ -1,9 +1,6 @@
 """Bounded, provider-neutral orchestration for one customer turn."""
 
-from collections.abc import Mapping
-from typing import Any
-
-from food_ordering.menu import ALIASES, Menu
+from food_ordering.menu import Menu
 from food_ordering.model_adapter import (
     AssistantMessage,
     CustomerMessage,
@@ -19,14 +16,15 @@ from food_ordering.session import Session
 from food_ordering.tool_protocol import (
     DisplayGroupSnapshot,
     DraftSnapshot,
+    Incomplete,
     MenuChoiceSnapshot,
     MenuExtraSnapshot,
     MenuItemSnapshot,
     MenuOptionSnapshot,
     MenuSnapshot,
     Malformed,
+    ModelResult,
     ResultPayload,
-    SchemaIssue,
     ShowDraft,
     ShowMenu,
     StoredLineSnapshot,
@@ -131,18 +129,11 @@ def _draft_snapshot(session: Session) -> DraftSnapshot:
 
 
 def _violation_fingerprint(
-    payload: Mapping[str, Any],
+    payload: ModelResult,
 ) -> tuple[str, str | None, str | None] | None:
-    outcome = payload.get("outcome")
-    if outcome not in {"INCOMPLETE", "UNSATISFIABLE", "CART_INVALID"}:
-        return None
-    subject = payload.get("subject")
-    key = payload.get("key")
-    return (
-        str(outcome),
-        subject if isinstance(subject, str) else None,
-        key if isinstance(key, str) else None,
-    )
+    if isinstance(payload, (Incomplete, Unsatisfiable)):
+        return payload.outcome, payload.subject, payload.key
+    return None
 
 
 class TurnProcessor:
@@ -173,7 +164,7 @@ class TurnProcessor:
             current_turn.append(response)
             messages.append(response)
             if not response.tool_calls:
-                if response.content.strip():
+                if response.completion_status == "complete" and response.content.strip():
                     self._session.transcript.append(TranscriptTurn(tuple(current_turn)))
                     return {"message": response.content}
                 return self._fallback(current_turn)
@@ -186,21 +177,20 @@ class TurnProcessor:
                     result = ToolResultMessage(
                         call.call_id,
                         call.name,
-                        Malformed(
-                            outcome="MALFORMED",
-                            remedy="correct_tool",
-                            reason="Per-turn tool-call budget exhausted.",
+                        Unsatisfiable(
+                            outcome="UNSATISFIABLE",
+                            remedy="change_request",
+                            reason="The per-turn tool-call limit was reached.",
                             resolution="Wait for a new customer turn before using another tool.",
-                            tool_name=call.name,
-                            issues=[SchemaIssue(path=[], message="Tool-call budget exhausted")],
-                        ).model_dump(mode="json", exclude_none=True),
+                            subject="turn tool-call budget",
+                        ),
                     )
                 else:
                     tool_calls += 1
                     result = self._dispatch(call)
                 current_turn.append(result)
                 messages.append(result)
-                if not budget_exhausted and result.payload["outcome"] == "MALFORMED":
+                if not budget_exhausted and isinstance(result.payload, Malformed):
                     malformed_calls += 1
                 fingerprint = _violation_fingerprint(result.payload)
                 if fingerprint is not None:
@@ -225,7 +215,7 @@ class TurnProcessor:
             return ToolResultMessage(
                 call.call_id,
                 call.name,
-                operation.model_dump(mode="json", exclude_none=True),
+                operation,
             )
         if isinstance(operation, ShowMenu):
             available_ids = {item.id for item in self._menu.menu}
@@ -233,32 +223,29 @@ class TurnProcessor:
                 (
                     item_id
                     for item_id in operation.item_ids
-                    if ALIASES.get(item_id, item_id) not in available_ids
+                    if item_id not in available_ids
                 ),
                 None,
             )
             if unknown is not None:
-                payload = Unsatisfiable(
+                payload: ModelResult = Unsatisfiable(
                     outcome="UNSATISFIABLE",
                     remedy="change_request",
                     reason="The requested item is not on the Menu.",
                     resolution="Choose an item listed in the Menu.",
                     subject=unknown,
-                ).model_dump(mode="json", exclude_none=True)
+                )
                 return ToolResultMessage(call.call_id, call.name, payload)
             payload = ResultPayload(
                 outcome="RESULT",
-                result=_menu_snapshot(
-                    self._menu,
-                    [ALIASES.get(item_id, item_id) for item_id in operation.item_ids],
-                ),
-            ).model_dump(mode="json", exclude_none=True)
+                result=_menu_snapshot(self._menu, operation.item_ids),
+            )
             return ToolResultMessage(call.call_id, call.name, payload)
         if isinstance(operation, ShowDraft):
             payload = ResultPayload(
                 outcome="RESULT",
                 result=_draft_snapshot(self._session),
-            ).model_dump(mode="json", exclude_none=True)
+            )
             return ToolResultMessage(call.call_id, call.name, payload)
         payload = Unsatisfiable(
             outcome="UNSATISFIABLE",
@@ -266,5 +253,5 @@ class TurnProcessor:
             reason="That operation is unavailable in the read-only processor.",
             resolution="Use show_menu or show_draft, or wait for mutation support.",
             subject=call.name,
-        ).model_dump(mode="json", exclude_none=True)
+        )
         return ToolResultMessage(call.call_id, call.name, payload)

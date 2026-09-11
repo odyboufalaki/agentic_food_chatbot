@@ -2,7 +2,9 @@
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Protocol, TypeAlias
+from typing import Any, Literal, Protocol, TypeAlias
+
+from food_ordering.tool_protocol import ModelResult
 
 
 @dataclass(frozen=True)
@@ -21,13 +23,14 @@ class CustomerMessage:
 class AssistantMessage:
     content: str = ""
     tool_calls: tuple[ToolCall, ...] = ()
+    completion_status: Literal["complete", "truncated"] = "complete"
 
 
 @dataclass(frozen=True)
 class ToolResultMessage:
     call_id: str
     name: str
-    payload: Mapping[str, Any]
+    payload: ModelResult
 
 
 ModelMessage: TypeAlias = CustomerMessage | AssistantMessage | ToolResultMessage

@@ -1,4 +1,7 @@
 from collections.abc import Sequence
+from typing import Any
+
+import pytest
 
 from food_ordering.menu import load_menu
 from food_ordering.model_adapter import (
@@ -28,6 +31,10 @@ class ScriptedModel:
         return next(self._responses)
 
 
+def _payload(message: ToolResultMessage) -> Any:
+    return message.payload.model_dump(mode="json", exclude_none=True)
+
+
 def test_model_can_read_menu_result_then_complete_a_natural_response() -> None:
     model = ScriptedModel(
         AssistantMessage(
@@ -47,8 +54,8 @@ def test_model_can_read_menu_result_then_complete_a_natural_response() -> None:
     result = model.requests[1][-1]
     assert isinstance(result, ToolResultMessage)
     assert result.call_id == "call-1"
-    assert result.payload["outcome"] == "RESULT"
-    assert result.payload["result"]["items"][0] == {
+    assert _payload(result)["outcome"] == "RESULT"
+    assert _payload(result)["result"]["items"][0] == {
         "item_id": "classic_burger",
         "name": "Classic Burger",
         "base_price_cents": 850,
@@ -82,12 +89,15 @@ def test_model_can_read_menu_result_then_complete_a_natural_response() -> None:
     }
 
 
-def test_unknown_requested_menu_item_returns_a_deterministic_rejection() -> None:
+@pytest.mark.parametrize("item_id", ["lobster", "burger"])
+def test_unknown_requested_menu_item_returns_a_deterministic_rejection(
+    item_id: str,
+) -> None:
     model = ScriptedModel(
         AssistantMessage(tool_calls=(ToolCall(
             call_id="missing-menu-item",
             name="show_menu",
-            arguments={"item_ids": ["lobster"]},
+            arguments={"item_ids": [item_id]},
         ),)),
         AssistantMessage(content="Lobster is not on the menu."),
     )
@@ -99,12 +109,12 @@ def test_unknown_requested_menu_item_returns_a_deterministic_rejection() -> None
     assert response == {"message": "Lobster is not on the menu."}
     result = model.requests[1][-1]
     assert isinstance(result, ToolResultMessage)
-    assert result.payload == {
+    assert _payload(result) == {
         "outcome": "UNSATISFIABLE",
         "remedy": "change_request",
         "reason": "The requested item is not on the Menu.",
         "resolution": "Choose an item listed in the Menu.",
-        "subject": "lobster",
+        "subject": item_id,
     }
 
 
@@ -140,7 +150,7 @@ def test_model_can_read_the_authoritative_draft_from_an_existing_session() -> No
     assert response == {"message": "You have two large fries with parmesan."}
     result = model.requests[1][-1]
     assert isinstance(result, ToolResultMessage)
-    assert result.payload == {
+    assert _payload(result) == {
         "outcome": "RESULT",
         "result": {
             "revision": 3,
@@ -192,12 +202,12 @@ def test_malformed_call_is_returned_for_one_blind_correction() -> None:
     malformed = model.requests[1][-1]
     assert isinstance(malformed, ToolResultMessage)
     assert malformed.call_id == "bad-1"
-    assert malformed.payload["outcome"] == "MALFORMED"
-    assert malformed.payload["remedy"] == "correct_tool"
+    assert _payload(malformed)["outcome"] == "MALFORMED"
+    assert _payload(malformed)["remedy"] == "correct_tool"
     corrected = model.requests[2][-1]
     assert isinstance(corrected, ToolResultMessage)
     assert corrected.call_id == "fixed-1"
-    assert corrected.payload["outcome"] == "RESULT"
+    assert _payload(corrected)["outcome"] == "RESULT"
 
 
 def test_exhausted_malformed_correction_budget_uses_customer_safe_fallback() -> None:
@@ -225,7 +235,7 @@ def test_exhausted_malformed_correction_budget_uses_customer_safe_fallback() -> 
     messages = session.transcript[0].messages
     assert isinstance(messages[-2], ToolResultMessage)
     assert messages[-2].call_id == "bad-3"
-    assert messages[-2].payload["outcome"] == "MALFORMED"
+    assert _payload(messages[-2])["outcome"] == "MALFORMED"
     assert messages[-1] == AssistantMessage(content=response["message"])
 
 
@@ -251,9 +261,9 @@ def test_tool_call_budget_pairs_the_over_budget_call_then_stops() -> None:
         if isinstance(message, ToolResultMessage)
     ]
     assert len(results) == 9
-    assert [result.payload["outcome"] for result in results[:8]] == ["RESULT"] * 8
+    assert [_payload(result)["outcome"] for result in results[:8]] == ["RESULT"] * 8
     assert results[8].call_id == "draft-9"
-    assert results[8].payload["outcome"] == "MALFORMED"
+    assert _payload(results[8])["outcome"] == "UNSATISFIABLE"
 
 
 def test_read_only_processor_rejects_mutation_and_leaves_authoritative_state_unchanged() -> None:
@@ -303,7 +313,7 @@ def test_read_only_processor_rejects_mutation_and_leaves_authoritative_state_unc
 
     rejection = model.requests[1][-1]
     assert isinstance(rejection, ToolResultMessage)
-    assert rejection.payload["outcome"] == "UNSATISFIABLE"
+    assert _payload(rejection)["outcome"] == "UNSATISFIABLE"
     assert (
         list(session.lines),
         session.instructions,
@@ -366,6 +376,23 @@ def test_empty_model_completion_uses_deterministic_fallback() -> None:
         "message": "I couldn't finish that request safely. Your draft is unchanged. Please try again.",
     }
     assert session.transcript[0].messages[-1] == AssistantMessage(content=response["message"])
+
+
+def test_truncated_nonempty_model_response_is_not_customer_facing() -> None:
+    session = Session()
+    model = ScriptedModel(AssistantMessage(
+        content="A partial internal response with validation details",
+        completion_status="truncated",
+    ))
+
+    response = TurnProcessor(model=model, menu=load_menu(), session=session).process(
+        "What is available?",
+    )
+
+    assert response["message"] == (
+        "I couldn't finish that request safely. Your draft is unchanged. Please try again."
+    )
+    assert "validation" not in response["message"]
 
 
 def test_model_failure_after_a_read_result_preserves_pair_and_uses_fallback() -> None:
