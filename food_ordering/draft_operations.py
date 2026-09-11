@@ -176,11 +176,7 @@ def validate_change_quantity(
         affected_line_ids = (line.line_id,)
         removed_line_ids = ()
     return Valid(
-        candidate=DraftState(
-            lines=tuple(candidate),
-            general_instructions=draft.general_instructions,
-            next_line_number=draft.next_line_number,
-        ),
+        candidate=replace(draft, lines=tuple(candidate)),
         effect=OperationEffect(
             operation="change_quantity",
             affected_line_ids=affected_line_ids,
@@ -205,11 +201,7 @@ def validate_remove_item(
     candidate = list(draft.lines)
     candidate.remove(line)
     return Valid(
-        candidate=DraftState(
-            lines=tuple(candidate),
-            general_instructions=draft.general_instructions,
-            next_line_number=draft.next_line_number,
-        ),
+        candidate=replace(draft, lines=tuple(candidate)),
         effect=OperationEffect(
             operation="remove_item",
             removed_line_ids=(line.line_id,),
@@ -226,11 +218,7 @@ def validate_clear_draft(
 
     del operation
     return Valid(
-        candidate=DraftState(
-            lines=(),
-            general_instructions="",
-            next_line_number=draft.next_line_number,
-        ),
+        candidate=replace(draft, lines=(), general_instructions=""),
         effect=OperationEffect(
             operation="clear_draft",
             removed_line_ids=tuple(line.line_id for line in draft.lines),
@@ -247,11 +235,7 @@ def validate_set_order_instructions(
 
     instructions = operation.instructions.strip()
     return Valid(
-        candidate=DraftState(
-            lines=draft.lines,
-            general_instructions=instructions,
-            next_line_number=draft.next_line_number,
-        ),
+        candidate=replace(draft, general_instructions=instructions),
         effect=OperationEffect(operation="set_order_instructions"),
         changed=instructions != draft.general_instructions,
     )
