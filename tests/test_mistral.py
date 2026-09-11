@@ -6,7 +6,7 @@ from mistralai.client import Mistral
 
 from agent import FoodOrderAgent
 from food_ordering.interpretation import MistralInterpreter, Settings
-from food_ordering.order import ClarificationContext
+from food_ordering.order import ClarificationContext, ResponseContext
 from food_ordering.proposals import Proposal
 
 
@@ -115,6 +115,32 @@ def test_mistral_renders_structured_clarification_without_tools():
     assert '"subject": "Classic Burger"' in requests[0]["messages"][-1]["content"]
 
 
+def test_mistral_renders_a_short_acknowledgement_without_order_authority():
+    requests = []
+
+    def handle(request):
+        requests.append(json.loads(request.content))
+        return completion("Got it — I’ve updated your order.")
+
+    context = ResponseContext(
+        kind="acknowledgement",
+        request="Make the spicy burgers four",
+        operations=({
+            "type": "set_quantity", "line_id": "L2",
+            "before_quantity": 1, "after_quantity": 4,
+        },),
+    )
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http_client:
+        with Mistral(api_key="test-key", client=http_client) as sdk:
+            response = MistralInterpreter(client=sdk).render_response(context)
+
+    assert response == "Got it — I’ve updated your order."
+    assert "tools" not in requests[0] and "response_format" not in requests[0]
+    renderer_context = requests[0]["messages"][-1]["content"]
+    assert '"draft_changed": true' in renderer_context
+    assert "line_id" not in renderer_context and "cents" not in renderer_context
+
+
 @pytest.mark.parametrize("failures,expected_calls", [
     ([429, 429], 2),
     ([503, 503], 2),
@@ -182,6 +208,35 @@ def test_one_recovery_adds_once(tmp_path, first_failure):
     assert "Total: $3.50" in response["message"]
     if first_failure == "invalid":
         assert "schema" in requests[1]["messages"][-1]["content"]
+
+
+def test_semantically_empty_edit_is_repaired_as_a_quantity_change(tmp_path):
+    requests = []
+    completions = iter([
+        '{"operations":[{"type":"add","item_id":"spicy_burger","quantity":1}]}',
+        ('{"operations":[{"type":"edit","target":{"item_id":"spicy_burger"},'
+         '"servings":4}]}'),
+        ('{"operations":[{"type":"set_quantity","target":{"item_id":"spicy_burger"},'
+         '"quantity":4}]}'),
+    ])
+
+    def handle(request):
+        requests.append(json.loads(request.content))
+        return completion(next(completions))
+
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http_client:
+        with Mistral(api_key="test-key", client=http_client) as sdk:
+            agent = FoodOrderAgent(
+                interpreter=MistralInterpreter(client=sdk),
+                log_path=tmp_path / "turns.jsonl",
+            )
+            agent.send("I want one spicy burger")
+            response = agent.send("Make the spicy burgers four")
+
+    assert "4 × Spicy Jalapeño Burger" in response["message"]
+    assert len(requests) == 3
+    assert "schema" in requests[-1]["messages"][-1]["content"]
+    assert "set_quantity" in requests[-1]["messages"][-1]["content"]
 
 
 def test_missing_credentials_is_a_customer_response_without_network(tmp_path, monkeypatch):

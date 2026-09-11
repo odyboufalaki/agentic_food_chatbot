@@ -41,7 +41,7 @@ def test_required_option_context_can_be_rendered_conversationally(tmp_path):
     )
     response = agent.send("A milkshake")["message"]
     assert response.startswith("Which milkshake flavor sounds good")
-    assert response.endswith("No changes have been applied.")
+    assert response.endswith("I haven't changed your order yet.")
     assert renderer.contexts == [ClarificationContext(
         reason="required_option",
         fallback_question="Choose flavor for Milkshake: vanilla, chocolate, strawberry, oreo.",
@@ -58,7 +58,7 @@ def test_clarification_renderer_failure_uses_python_fallback(tmp_path):
         log_path=tmp_path / "turns.jsonl",
     )
     assert agent.send("Some burgers")["message"] == (
-        "What exact quantity do you mean? No changes have been applied."
+        "What exact quantity do you mean? I haven't changed your order yet."
     )
 
 
@@ -183,7 +183,8 @@ def test_invalid_resolution_is_revalidated_and_keeps_the_pending_change(tmp_path
     agent = FoodOrderAgent(interpreter=interpreter, log_path=tmp_path / "turns.jsonl")
     agent.send("A cola and milkshake")
     rejected = agent.send("Vanilla bean")["message"]
-    assert "supported flavor" in rejected and "No changes have been applied" in rejected
+    assert rejected.startswith("I couldn't apply that answer to the change we're working on.")
+    assert "haven't changed" in rejected
     resolved = agent.send("Chocolate")["message"]
     assert interpreter.contexts[2]["draft"] == []
     assert interpreter.contexts[2]["pending_clarification"] is not None

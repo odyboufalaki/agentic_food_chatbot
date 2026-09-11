@@ -1,6 +1,6 @@
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class StrictModel(BaseModel):
@@ -34,10 +34,20 @@ class Edit(StrictModel):
     options: dict[str, str] = Field(default_factory=dict)
     add_extras: list[str] = Field(default_factory=list)
     remove_extras: list[str] = Field(default_factory=list)
-    quantity: int | Literal["all"] | None = Field(default=None)
+    servings: int | Literal["all"] | None = Field(default=None)
     instructions: str | None = None
     replacement_item_id: str | None = None
     replacement_notes: Literal["keep", "discard"] | None = None
+
+    @model_validator(mode="after")
+    def changes_configuration(self) -> Self:
+        if (not self.options and not self.add_extras and not self.remove_extras
+                and self.instructions is None and self.replacement_item_id is None):
+            raise ValueError(
+                "edit must change an option, extra, instruction, or item; "
+                "use set_quantity for a final quantity"
+            )
+        return self
 
 
 class RemoveLine(StrictModel):
@@ -111,7 +121,7 @@ Operation = Annotated[
 class Proposal(StrictModel):
     operations: list[Operation] = Field(min_length=1)
     corrected_fields: list[Annotated[str, Field(pattern=(
-        r"^\d+\.(quantity|item_id|instructions|extras|add_extras|remove_extras|"
+        r"^\d+\.(quantity|servings|item_id|instructions|extras|add_extras|remove_extras|"
         r"replacement_item_id|replacement_notes|options\.[a-z_]+|"
         r"target\.(line_id|item_id|instructions|extras|options\.[a-z_]+))$"
     ))]] = Field(default_factory=list)

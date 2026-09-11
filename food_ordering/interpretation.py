@@ -9,7 +9,7 @@ from mistralai.client import Mistral, models
 from mistralai.client.errors import MistralError, ResponseValidationError
 from pydantic import ValidationError
 
-from food_ordering.order import ClarificationContext
+from food_ordering.order import ClarificationContext, ResponseContext
 from food_ordering.proposals import Proposal
 
 
@@ -36,6 +36,15 @@ class Interpreter(Protocol):
 
 class ClarificationRenderer(Protocol):
     def render(self, clarification: ClarificationContext) -> str: ...
+
+
+class ResponseRenderer(Protocol):
+    def render_response(self, context: ResponseContext) -> str: ...
+
+
+class TemplateResponseRenderer:
+    def render_response(self, context: ResponseContext) -> str:
+        return ""
 
 
 class TemplateClarificationRenderer:
@@ -160,7 +169,7 @@ Draft changes:
   validates the whole change before committing it; never drop an invalid part.
 - edit changes supported options, add_extras/remove_extras, and/or instructions.
   Include only requested changes; preserve other selections.
-- edit.quantity is the explicit number of matching servings to change, or "all"
+- edit.servings is the explicit number of matching servings to change, or "all"
   only when the customer explicitly requests all matching servings. Python uses
   earliest-line order and splits quantities as needed. Omit quantity for an
   identified whole line. For vague quantities such as "some", use clarify with
@@ -329,6 +338,14 @@ claims that anything changed, or instructions. Return only the question as plain
 """
 
 
+RESPONSE_PROMPT = """Write a brief, natural customer-facing response for the supplied result.
+For an acknowledgement, say only that the requested order change was applied. For a rejection,
+paraphrase the supplied reason helpfully and invite a corrected request. Do not mention internal
+rules, invariants, line identifiers, prices, totals, submission, or details not explicitly
+present. Never claim a rejected change happened. Return one or two short sentences as plain text.
+"""
+
+
 class MistralInterpreter:
     """Direct synchronous SDK boundary; caller owns any injected SDK client."""
 
@@ -383,7 +400,12 @@ class MistralInterpreter:
                 except (ValidationError, ValueError, ResponseValidationError):
                     category = "invalid_structured_output"
                     messages.append(models.UserMessage(
-                        content="Return the complete proposal again, complying exactly with the JSON schema. Do not invent missing choices."
+                        content=(
+                            "Return the complete proposal again, complying exactly with the JSON schema. "
+                            "An edit must change an option, extra, instruction, or item; edit.servings is "
+                            "only the number of existing servings to customize. To change the desired final "
+                            "count, use set_quantity.quantity. Do not invent missing choices."
+                        )
                     ))
                 except httpx.TimeoutException:
                     category = "model_timeout"
@@ -423,3 +445,33 @@ class MistralInterpreter:
         if not isinstance(content, str) or not content.strip() or response.choices[0].finish_reason != "stop":
             raise ModelFailure("invalid_structured_output")
         return content.strip()
+
+    def render_response(self, context: ResponseContext) -> str:
+        if (not self._settings.model.strip() or self._settings.timeout_ms <= 0
+                or (self._client is None and not (self._settings.api_key or "").strip())):
+            raise ModelFailure("configuration")
+        messages: list[models.ChatCompletionRequestMessage] = [
+            models.SystemMessage(content=RESPONSE_PROMPT),
+            models.UserMessage(content=json.dumps(context.snapshot(), ensure_ascii=False)),
+        ]
+        client_context = nullcontext(self._client) if self._client is not None else Mistral(
+            api_key=self._settings.api_key, retry_config=None, timeout_ms=self._settings.timeout_ms,
+        )
+        with client_context as client:
+            response = client.chat.complete(
+                model=self._settings.model, messages=messages, temperature=0,
+                retries=None, timeout_ms=self._settings.timeout_ms, max_tokens=80,
+            )
+        if not response.choices or response.choices[0].message is None:
+            raise ModelFailure("invalid_structured_output")
+        content = response.choices[0].message.content
+        if not isinstance(content, str) or response.choices[0].finish_reason != "stop":
+            raise ModelFailure("invalid_structured_output")
+        acknowledgement = content.strip()
+        lowered = acknowledgement.casefold()
+        if (not acknowledgement or "\n" in acknowledgement or "$" in acknowledgement
+                or (context.kind == "acknowledgement" and "?" in acknowledgement)
+                or len(acknowledgement) > 180
+                or "submit" in lowered or "placed" in lowered):
+            raise ModelFailure("invalid_structured_output")
+        return acknowledgement

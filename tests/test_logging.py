@@ -43,7 +43,7 @@ def test_rejected_atomic_proposal_does_not_consume_line_ids(tmp_path):
         {"operations": [add("burger")]},
     ), log_path=path)
 
-    assert "No changes have been applied" in agent.send("Fries and a milkshake")["message"]
+    assert "haven't changed" in agent.send("Fries and a milkshake")["message"]
     agent.send("Cancel that change")
     agent.send("Add a burger")
 
@@ -114,6 +114,33 @@ def test_known_credentials_are_redacted_even_when_pasted_into_input(tmp_path, mo
     agent.send("My token is secret-provider-token")
     assert "secret-provider-token" not in path.read_text()
     assert "[REDACTED]" in path.read_text()
+
+
+def test_rejected_turn_logs_the_validated_proposal_separately_from_applied_operations(tmp_path):
+    path = tmp_path / "turns.jsonl"
+    agent = FoodOrderAgent(interpreter=ScriptedInterpreter(
+        {"operations": [add("burger")]},
+        {"operations": [{
+            "type": "edit", "target": {"item_id": "burger"},
+            "servings": 2, "options": {"size": "large"},
+        }]},
+    ), log_path=path)
+    agent.send("One burger")
+    agent.send("Make two burgers large")
+
+    rejected = json.loads(path.read_text().splitlines()[-1])
+    assert rejected["proposal"]["operations"][0] == {
+        "type": "edit",
+        "target": {
+            "line_id": None, "item_id": "burger", "options": {},
+            "extras": [], "instructions": None,
+        },
+        "options": {"size": "large"}, "add_extras": [], "remove_extras": [],
+        "servings": 2, "instructions": None, "replacement_item_id": None,
+        "replacement_notes": None,
+    }
+    assert rejected["operations"] == []
+    assert rejected["error_category"] == "invalid_selection"
 
 
 def test_closed_stderr_during_logging_failure_still_returns_the_draft(tmp_path):

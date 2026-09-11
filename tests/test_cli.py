@@ -93,7 +93,7 @@ def test_cli_customization_demo_reviews_and_submits_the_logged_order(tmp_path):
     transport = RestaurantTransport()
     agent = restaurant_agent(tmp_path, transport,
         {"operations": [add("burger", quantity=2)]},
-        {"operations": [edit(quantity=1, options={"patty": "chicken"}, instructions="no onions")]},
+        {"operations": [edit(servings=1, options={"patty": "chicken"}, instructions="no onions")]},
         {"operations": [{"type": "review"}]}, {"operations": [{"type": "confirm"}]},
     )
     output = StringIO()

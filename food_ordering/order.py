@@ -1,5 +1,5 @@
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, Literal
 
 from food_ordering.menu import ALIASES, Menu, money
 from food_ordering.proposals import Add, ChangeQuantity, Edit, Target
@@ -21,6 +21,32 @@ class ClarificationContext:
         return {
             "reason": self.reason, "subject": self.subject, "field": self.field,
             "choices": list(self.choices), "draft_changed": False,
+        }
+
+
+@dataclass(frozen=True)
+class ResponseContext:
+    kind: Literal["acknowledgement", "rejection"]
+    request: str
+    operations: tuple[dict[str, Any], ...] = ()
+    reason: str | None = None
+
+    def snapshot(self) -> dict[str, Any]:
+        def public(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    key: public(part) for key, part in value.items()
+                    if key not in {"line_id", "line_ids", "source_line_id"}
+                    and not key.endswith("_cents")
+                }
+            if isinstance(value, list):
+                return [public(part) for part in value]
+            return value
+
+        return {
+            "kind": self.kind, "request": self.request, "reason": self.reason,
+            "operations": [public(operation) for operation in self.operations],
+            "draft_changed": self.kind == "acknowledgement",
         }
 
 
@@ -189,10 +215,10 @@ def edit_servings(
     operation: Edit, lines: list[OrderLine], menu: Menu, next_line_number: int,
 ) -> tuple[list[OrderLine], int, list[dict[str, Any]]]:
     matches = matching_lines(operation.target, lines)
-    if operation.quantity is None:
+    if operation.servings is None:
         matches = [resolve_target(operation.target, lines)]
     available = sum(line.quantity for line in matches)
-    quantity = available if operation.quantity in (None, "all") else operation.quantity
+    quantity = available if operation.servings in (None, "all") else operation.servings
     if not isinstance(quantity, int) or quantity <= 0 or quantity > available:
         raise InvalidSelection(f"Choose a positive quantity up to {available} matching servings.")
     candidate = list(lines)

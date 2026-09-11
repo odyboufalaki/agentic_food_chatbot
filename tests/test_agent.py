@@ -13,6 +13,16 @@ class ScriptedInterpreter:
         return proposal
 
 
+class CapturingResponseRenderer:
+    def __init__(self, response):
+        self.response = response
+        self.contexts = []
+
+    def render_response(self, context):
+        self.contexts.append(context)
+        return self.response
+
+
 def add(item_id, quantity=1, options=None, extras=None):
     return {
         "type": "add",
@@ -21,6 +31,57 @@ def add(item_id, quantity=1, options=None, extras=None):
         "options": options or {},
         "extras": extras or [],
     }
+
+
+def test_validated_change_can_receive_a_natural_acknowledgement(tmp_path):
+    renderer = CapturingResponseRenderer("Got it — I’ve updated your order.")
+    agent = FoodOrderAgent(
+        interpreter=ScriptedInterpreter({"operations": [add("burger")]}),
+        response_renderer=renderer,
+        log_path=tmp_path / "turns.jsonl",
+    )
+
+    message = agent.send("I would like a burger")["message"]
+
+    assert message.startswith("Got it — I’ve updated your order.\n\nDraft order:")
+    assert "1 × Classic Burger" in message and "Total: $8.50" in message
+    assert renderer.contexts[0].request == "I would like a burger"
+    assert renderer.contexts[0].kind == "acknowledgement"
+    assert renderer.contexts[0].operations[0]["type"] == "add"
+
+
+def test_customer_fixable_rejection_can_be_paraphrased_naturally(tmp_path):
+    class RejectionRenderer(CapturingResponseRenderer):
+        def render_response(self, context):
+            self.contexts.append(context)
+            if context.kind == "rejection":
+                return "I couldn’t apply that quantity. Could you try wording it another way?"
+            return ""
+
+    renderer = RejectionRenderer("")
+    agent = FoodOrderAgent(
+        interpreter=ScriptedInterpreter(
+            {"operations": [add("burger")]},
+            {"operations": [{
+                "type": "edit", "target": {"item_id": "burger"},
+                "servings": 2, "options": {"size": "large"},
+            }]},
+        ),
+        response_renderer=renderer,
+        log_path=tmp_path / "turns.jsonl",
+    )
+    agent.send("One burger")
+
+    message = agent.send("Make two of the burgers large")["message"]
+
+    assert message == (
+        "I couldn’t apply that quantity. Could you try wording it another way? "
+        "I haven't changed your order."
+    )
+    rejection = renderer.contexts[-1]
+    assert rejection.kind == "rejection"
+    assert "up to 1 matching servings" in rejection.reason
+    assert rejection.operations == ()
 
 
 def test_remove_extra_reprices_the_draft(tmp_path):
@@ -134,7 +195,7 @@ def test_invalid_mixed_edits_preserve_the_entire_draft(tmp_path, invalid):
     original = agent.send("Two cheeseburgers and a cola")
     failed = agent.send("Remove the cola, resize the burgers and make another change")["message"]
     if invalid == {"type": "remove_line", "target": {}}:
-        assert "which" in failed.lower() and "No changes have been applied" in failed
+        assert "which" in failed.lower() and "haven't changed" in failed
     else:
         assert "unchanged" in failed
     assert agent.send("Show draft") == original
@@ -162,7 +223,7 @@ def test_ambiguous_reference_never_selects_an_arbitrary_line(tmp_path, second_op
     ), log_path=tmp_path / "turns.jsonl")
     original = agent.send("Add two separate burger selections")
     response = agent.send("Remove one burger")["message"]
-    assert "No changes have been applied" in response and "which" in response.lower()
+    assert "haven't changed" in response and "which" in response.lower()
     assert agent.send("Show draft") == original
 
 
@@ -188,7 +249,7 @@ def test_invalid_change_after_cancellation_rolls_back_the_clear(tmp_path):
     ), log_path=tmp_path / "turns.jsonl")
     original = agent.send("A burger")
     response = agent.send("Cancel my order and add a milkshake")["message"]
-    assert "flavor" in response and "No changes have been applied" in response
+    assert "flavor" in response and "haven't changed" in response
     assert agent.send("Show draft") == original
 
 

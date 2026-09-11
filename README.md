@@ -151,7 +151,9 @@ Live language interpretation remains a separate evaluation.
 - Draft changes use separate `edit`, `set_quantity`, `increase_quantity`,
   `remove_units`, `remove_line`, and `clear_draft` operations. Targets match a
   current line ID or item ID with optional current options/extras/instructions.
-  Edits with an explicit quantity or “all” visit matching lines in stored order
+  Edits use `servings` for the explicit number to customize, or “all”; this is
+  deliberately distinct from `set_quantity.quantity`, which is the desired final
+  count. They visit matching lines in stored order
   and split only when some servings acquire a different configuration.
   Otherwise exactly one line must match; ambiguous targets require clarification.
   Edits preserve surviving line IDs and reprice supported choices from the menu.
@@ -173,9 +175,12 @@ Live language interpretation remains a separate evaluation.
   completes it; Python then revalidates and applies the entire proposal atomically.
   When clarification is needed, Python builds a structured context containing
   the reason and any menu-derived subject, field, and choices. The Mistral adapter
-  makes one response-only call to turn that context into a concise question; it
-  receives no mutation or submission capability. A provider failure or empty
-  response falls back to Python's deterministic question.
+  can make a response-only call to turn that context into a concise question.
+  It can also add a short acknowledgement before a successfully changed draft or
+  paraphrase a customer-fixable rejection. These calls receive no mutation,
+  pricing, or submission capability; Python always supplies the authoritative
+  draft and unchanged-order disclosure. A provider failure or invalid response
+  falls back to deterministic text.
   SDK retries are explicitly
   disabled; each turn permits an initial request and one transient retry or one
   schema repair, with a 20-second timeout per request. Authentication/configuration
@@ -218,6 +223,9 @@ are owned by the caller; default clients are closed after each interpretation.
 `FoodOrderAgent(clarification_renderer=...)` accepts a separate response renderer.
 Scripted or custom interpreters use the template renderer unless one is supplied;
 the default Mistral interpreter also renders clarification questions.
+`FoodOrderAgent(response_renderer=...)` accepts the presentation-only renderer
+used for acknowledgements and customer-fixable rejections. When the agent creates
+its default Mistral interpreter, that interpreter fills both rendering roles.
 
 Submission is injectable with `FoodOrderAgent(submitter=...)`. The synchronous
 `submit(payload)` boundary returns a `SubmissionResult` describing acceptance,
@@ -236,11 +244,13 @@ connection service. It refuses direct execution inside an already running loop.
 
 ## Logging and privacy
 
-Every send attempt writes session/turn IDs, timestamp, input, response, validated
-operations, before/after totals in cents, current and reviewed revisions/status
-transition, elapsed milliseconds, and an error category. `tool_calls` reports only
-actual attempts and their arguments/results. Failed draft validation records no
-applied operations; a blocked checkout can retain valid edits made in that turn.
+Every send attempt writes session/turn IDs, timestamp, input, response, the
+validated proposal, applied operations, before/after totals in cents, current and
+reviewed revisions/status transition, elapsed milliseconds, and an error category.
+`tool_calls` reports only
+actual attempts and their arguments/results. Failed draft validation records its
+proposal but no applied operations; a blocked checkout can retain valid edits made
+in that turn.
 
 Logs retain customer conversation text locally. They contain no SDK response
 objects, HTTP headers, exception bodies, or hidden reasoning. The configured

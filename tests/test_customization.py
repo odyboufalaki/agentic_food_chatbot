@@ -14,7 +14,7 @@ def test_customize_one_burger_then_review_and_submit_scoped_notes(tmp_path):
     transport = RestaurantTransport()
     agent = restaurant_agent(tmp_path, transport,
         {"operations": [add("burger"), add("burger")]},
-        {"operations": [edit(quantity=1, options={"patty": "chicken"}, instructions="no onions")]},
+        {"operations": [edit(servings=1, options={"patty": "chicken"}, instructions="no onions")]},
         {"operations": [{"type": "review"}]},
         {"operations": [{"type": "confirm"}]},
     )
@@ -45,7 +45,7 @@ def test_explicit_servings_span_stored_lines_in_earliest_order(tmp_path, quantit
     transport = RestaurantTransport()
     agent = restaurant_agent(tmp_path, transport,
         {"operations": [add("burger"), add("burger", quantity=2)]},
-        {"operations": [edit(quantity=quantity, instructions="cut in half")]},
+        {"operations": [edit(servings=quantity, instructions="cut in half")]},
         {"operations": [{"type": "review"}]}, {"operations": [{"type": "confirm"}]},
     )
     agent.send("One burger, then two more")
@@ -74,7 +74,7 @@ def test_ambiguous_milkshake_target_does_not_use_recent_flavor(tmp_path):
     agent.send("One strawberry milkshake")
     agent.send("And a chocolate milkshake")
     question = agent.send("Make the milkshake large")["message"]
-    assert "which" in question.lower() and "No changes" in question
+    assert "which" in question.lower() and "haven't changed" in question
     result = agent.send("The strawberry one")["message"]
     assert "size: large, flavor: strawberry" in result
     assert "size: regular, flavor: chocolate" in result
@@ -86,11 +86,11 @@ def test_ambiguous_number_of_servings_requires_quantity_then_splits(tmp_path):
     agent = restaurant_agent(tmp_path, transport,
         {"operations": [add("burger", quantity=3)]},
         {"operations": [{"type": "clarify", "reason": "quantity", "item_id": "burger"}]},
-        {"operations": [edit(quantity=1, instructions="no onions")]},
+        {"operations": [edit(servings=1, instructions="no onions")]},
     )
     agent.send("Three burgers")
     question = agent.send("Make some without onions")["message"]
-    assert "how many" in question.lower() and "No changes" in question
+    assert "how many" in question.lower() and "haven't changed" in question
     result = agent.send("One")["message"]
     assert "2 × Classic Burger" in result and "1 × Classic Burger" in result
     assert result.count("no onions") == 1 and "Total: $25.50" in result
@@ -157,14 +157,16 @@ def test_clarification_cannot_silently_change_resolved_quantity_options_or_extra
     )
     agent.send("Two large milkshakes with cherries")
     response = agent.send("Vanilla")["message"]
-    assert "No changes" in response
+    assert response.startswith("I couldn't apply that answer to the change we're working on.")
+    assert "preserve the resolved" not in response.lower()
+    assert "haven't changed" in response
     resolved = agent.send("Vanilla, keeping everything else")["message"]
     assert "2 × Milkshake" in resolved and "Total: $15.50" in resolved
 
 
 @pytest.mark.parametrize("operation, expected", [
     (edit(options={"size": "large"}), [(2, "large", "no onions")]),
-    (edit(quantity=1, options={"patty": "chicken"}), [(1, "regular", "no onions"), (1, "regular", "no onions")]),
+    (edit(servings=1, options={"patty": "chicken"}), [(1, "regular", "no onions"), (1, "regular", "no onions")]),
     ({"type": "set_quantity", "target": {"item_id": "burger"}, "quantity": 3}, [(3, "regular", "no onions")]),
 ])
 def test_notes_follow_resizing_and_splitting_without_duplicate_extras(tmp_path, operation, expected):
@@ -172,7 +174,7 @@ def test_notes_follow_resizing_and_splitting_without_duplicate_extras(tmp_path, 
     agent = restaurant_agent(tmp_path, transport,
         {"operations": [{**add("burger", quantity=2, extras=["cheese"]), "instructions": "no onions"}]},
         {"operations": [operation]},
-        {"operations": [edit(quantity="all", add_extras=["cheese", "cheese"])]},
+        {"operations": [edit(servings="all", add_extras=["cheese", "cheese"])]},
         {"operations": [{"type": "review"}]}, {"operations": [{"type": "confirm"}]},
     )
     agent.send("Two cheeseburgers without onions")
@@ -201,7 +203,7 @@ def test_replacement_asks_whether_existing_notes_still_apply(tmp_path, decision,
     )
     agent.send("A burger without onions")
     question = agent.send("Replace the burger with fries")["message"]
-    assert "keep" in question.lower() and "discard" in question.lower() and "No changes" in question
+    assert "keep" in question.lower() and "discard" in question.lower() and "haven't changed" in question
     resolved = agent.send(decision)["message"]
     assert "French Fries" in resolved and "Classic Burger" not in resolved
     assert ("no onions" in resolved) is has_note
@@ -220,7 +222,7 @@ def test_explicit_pending_correction_changes_only_the_named_field(tmp_path):
          "corrected_fields": ["0.quantity"]},
     )
     agent.send("Two large milkshakes")
-    assert "No changes" in agent.send("Actually three, vanilla")["message"]
+    assert "haven't changed" in agent.send("Actually three, vanilla")["message"]
     result = agent.send("Three large vanilla milkshakes")["message"]
     assert "3 × Milkshake" in result and "Total: $22.50" in result
 
@@ -248,7 +250,7 @@ def test_notes_distinguish_otherwise_identical_servings_and_can_be_cleared(tmp_p
     transport = RestaurantTransport()
     agent = restaurant_agent(tmp_path, transport,
         {"operations": [add("burger", quantity=2)]},
-        {"operations": [edit(quantity=1, instructions="no onions")]},
+        {"operations": [edit(servings=1, instructions="no onions")]},
         {"operations": [edit(target={"item_id": "burger", "instructions": "no onions"}, instructions="")]},
         {"operations": [{"type": "review"}]}, {"operations": [{"type": "confirm"}]},
     )
@@ -267,7 +269,7 @@ def test_split_log_accounts_for_affected_and_unaffected_servings(tmp_path):
     transport = RestaurantTransport()
     agent = restaurant_agent(tmp_path, transport,
         {"operations": [add("burger", quantity=3)]},
-        {"operations": [edit(quantity=1, instructions="no onions")]},
+        {"operations": [edit(servings=1, instructions="no onions")]},
     )
     agent.send("Three burgers")
     response = agent.send("One without onions")
@@ -315,7 +317,7 @@ def test_flavor_answer_preserves_menu_default_size(tmp_path):
         {"operations": [add("milkshake", quantity=2, options={"flavor": "vanilla"})]},
     )
     agent.send("Two milkshakes")
-    assert "No changes" in agent.send("Vanilla")["message"]
+    assert "haven't changed" in agent.send("Vanilla")["message"]
     result = agent.send("Vanilla, keeping the default size")["message"]
     assert "size: regular" in result and "Total: $11.00" in result
 
@@ -332,6 +334,6 @@ def test_unclear_replacement_note_answer_repeats_the_question(tmp_path):
     agent.send("A burger without onions")
     agent.send("Replace it with fries")
     question = agent.send("Maybe")["message"]
-    assert "keep" in question.lower() and "discard" in question.lower() and "No changes" in question
+    assert "keep" in question.lower() and "discard" in question.lower() and "haven't changed" in question
     result = agent.send("Discard")["message"]
     assert "French Fries" in result and "no onions" not in result

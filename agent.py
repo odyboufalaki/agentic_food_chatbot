@@ -10,9 +10,9 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from food_ordering.clarification import validate_pending_resolution
-from food_ordering.interpretation import ClarificationRenderer, Interpreter, MistralInterpreter, ModelFailure, TemplateClarificationRenderer
+from food_ordering.interpretation import ClarificationRenderer, Interpreter, MistralInterpreter, ModelFailure, ResponseRenderer, TemplateClarificationRenderer, TemplateResponseRenderer
 from food_ordering.menu import load_menu, menu_context
-from food_ordering.order import ClarificationContext, ClarificationNeeded, InvalidSelection, OrderLine, build_clarification_context, change_quantity, display_groups, edit_servings, normalize, render_draft, render_menu, resolve_target, submission_payload
+from food_ordering.order import ClarificationContext, ClarificationNeeded, InvalidSelection, OrderLine, ResponseContext, build_clarification_context, change_quantity, display_groups, edit_servings, normalize, render_draft, render_menu, resolve_target, submission_payload
 from food_ordering.proposals import AbandonPending, Add, CancelPending, ChangeQuantity, Clarify, ClearDraft, Edit, MenuQuestion, NewOrder, Proposal, RemoveLine, RetrySubmission, Review, SetInstructions, Submit, Summary, Unsupported
 from food_ordering.submission import MCPSubmitter, Submitter, render_receipt
 from food_ordering.turn_logging import TurnLogger
@@ -44,11 +44,17 @@ class TurnHandled(Exception):
 class FoodOrderAgent:
     def __init__(self, *, interpreter: Interpreter | None = None, log_path: Path | None = None,
                  submitter: Submitter | None = None,
-                 clarification_renderer: ClarificationRenderer | None = None) -> None:
+                 clarification_renderer: ClarificationRenderer | None = None,
+                 response_renderer: ResponseRenderer | None = None) -> None:
+        default_interpreter = interpreter is None
         self._interpreter = interpreter if interpreter is not None else MistralInterpreter()
         self._clarification_renderer = (clarification_renderer if clarification_renderer is not None
                                         else self._interpreter if isinstance(self._interpreter, MistralInterpreter)
                                         else TemplateClarificationRenderer())
+        self._response_renderer = (response_renderer if response_renderer is not None
+                                   else self._interpreter if default_interpreter
+                                   and isinstance(self._interpreter, MistralInterpreter)
+                                   else TemplateResponseRenderer())
         self._menu = load_menu()
         self._lines: list[OrderLine] = []
         self._instructions = ""
@@ -85,6 +91,7 @@ class FoodOrderAgent:
         preserve_pending_proposal = False
         lifecycle_operations: list[dict[str, Any]] = []
         proposal: Proposal | None = None
+        interpreted_proposal: Proposal | None = None
         try:
             if not isinstance(message, str) or not message.strip():
                 raise InvalidSelection("Please enter a nonempty message.")
@@ -98,6 +105,7 @@ class FoodOrderAgent:
                                                 for group in display_groups(self._lines)]},
                 pending_clarification=pending_at_start.snapshot() if pending_at_start is not None else None,
             ))
+            interpreted_proposal = proposal
             if any(isinstance(operation, CancelPending) for operation in proposal.operations):
                 if pending_at_start is None or len(proposal.operations) != 1:
                     raise InvalidSelection("There is no single pending change to cancel.")
@@ -217,6 +225,17 @@ class FoodOrderAgent:
                     answers.append(self._receipt_message + "\n" + render_draft(candidate, instructions).removeprefix("Draft order:\n"))
                 else:
                     answers.append(render_draft(candidate, instructions))
+            if changed:
+                try:
+                    acknowledgement = self._response_renderer.render_response(ResponseContext(
+                        kind="acknowledgement",
+                        request=message,
+                        operations=tuple(dict(operation) for operation in validated_operations),
+                    )).strip()
+                except Exception:
+                    acknowledgement = ""
+                if acknowledgement:
+                    answers.insert(0, acknowledgement)
             response: dict[str, Any] = {"message": "\n\n".join(answers)}
             if pending_at_start is not None and changed and not abandoned_pending and not clears_pending:
                 lifecycle_operations.append({
@@ -317,19 +336,33 @@ class FoodOrderAgent:
                 question = error.context.fallback_question
             if not question:
                 question = error.context.fallback_question
-            response = {"message": question + " No changes have been applied."}
+            response = {"message": question + " I haven't changed your order yet."}
         except InvalidSelection as error:
             failed_conversation_turn = True
             error_category = "invalid_selection"
             operations = lifecycle_operations
             if pending_at_start is not None and self._pending_change is not None:
                 response = {"message": (
-                    f"{error} {self._pending_change.clarification.fallback_question} "
-                    "No changes have been applied."
+                    "I couldn't apply that answer to the change we're working on. "
+                    f"{self._pending_change.clarification.fallback_question} "
+                    "I haven't changed your order yet."
                 )}
             else:
-                response = {"message": (render_draft(self._lines, self._instructions) + f"\n{error} The order was not submitted.")
-                        if draft_changed else f"{error} Your draft is unchanged. Please restate the complete request."}
+                if draft_changed:
+                    response = {"message": render_draft(self._lines, self._instructions)
+                                + f"\n{error} The order was not submitted."}
+                else:
+                    try:
+                        explanation = self._response_renderer.render_response(ResponseContext(
+                            kind="rejection", request=message, reason=str(error),
+                        )).strip()
+                    except Exception:
+                        explanation = ""
+                    response = {"message": (
+                        explanation + " I haven't changed your order."
+                        if explanation else
+                        f"{error} Your draft is unchanged. Please restate the complete request."
+                    )}
         except ValidationError:
             failed_conversation_turn = True
             error_category = "invalid_structured_output"
@@ -357,7 +390,10 @@ class FoodOrderAgent:
             "session_id": self._session_id, "turn_id": self._turn_id,
             "timestamp": datetime.now(UTC).isoformat(),
             "input": message if isinstance(message, str) else None,
-            "response": response, "operations": operations,
+            "response": response,
+            "proposal": (interpreted_proposal.model_dump(mode="json")
+                         if interpreted_proposal is not None else None),
+            "operations": operations,
             "totals": {"before_cents": before_total, "after_cents": sum(line.total_cents for line in self._lines)},
             "state_transition": {
                 "before": {"status": before_status, "revision": before_revision,
