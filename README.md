@@ -1,9 +1,9 @@
 # Food-ordering chatbot
 
-Build, edit, review, and submit an in-memory food order through natural language.
-Mistral translates customer requests into protocol-version-1 tool calls; Python
-validates every operation, owns the authoritative Draft order, calculates prices,
-and constructs the restaurant payload.
+A natural-language food ordering agent built with Mistral and MCP.
+
+Mistral interprets customer requests and turns them into structured tool calls.  
+The Python application owns the actual order state, validates menu choices, applies edits, calculates prices, handles review and confirmation, and submits the final order to the restaurant MCP server.
 
 ## Setup
 
@@ -12,108 +12,123 @@ Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run:
 ```sh
 uv python install 3.13
 uv sync --locked
+
 export MISTRAL_API_KEY='your-studio-api-key'
 export APPLICANT_EMAIL='your-cv-email@example.com'
-# Optional:
+
+# Optional
 export MISTRAL_MODEL='mistral-small-latest'
 export FOOD_ORDER_LOG_PATH='logs/turns.jsonl'
+
 uv run --locked python main.py
 ```
 
-The project requires Python 3.13 or newer. Environment variables are read when
-the agent is constructed; `.env` files are not loaded automatically.
+Python 3.13+ is required.
 
-The programmatic API uses the same synchronous path as the CLI:
+Environment variables are read when the agent is created. `.env` files are not loaded automatically.
+
+## Programmatic usage
+
+The same agent can also be used directly from Python:
 
 ```python
 from agent import FoodOrderAgent
 
 agent = FoodOrderAgent()
-print(agent.send("I'd like a large classic burger with cheese")["message"])
+
+print(
+    agent.send(
+        "I'd like a large classic burger with cheese"
+    )["message"]
+)
+
 print(agent.send("Review my order")["message"])
+
 result = agent.send("Yes")
 print(result["message"])
 ```
 
-Every `send(str)` result contains a nonempty `message`. Only an actual MCP
-`submit_order` invocation adds `tool_calls`, with the exact arguments and
-dictionary result.
+Every call to `send()` returns a dictionary containing a non-empty `message`.
+
+If an MCP `submit_order` call was actually made, the response also includes the submitted arguments and returned result under `tool_calls`.
 
 ## Conversation behavior
 
-Operations emitted together are validated and applied in order. A valid operation
-remains committed when an independent sibling is incomplete or invalid. For
-example, asking for a Classic Burger, Spicy Jalapeño Burger, and flavorless
-Milkshake adds both burgers and asks which Milkshake flavor is wanted.
+The model is responsible for understanding the customer's language, but it does not directly modify the order.
 
-There is no stored pending change. Tool calls, structured Outcomes, and customer
-messages are retained in a bounded provider-neutral transcript. A later answer is
-interpreted by a fresh model call, which must reconstruct a new complete operation.
+Instead, it emits structured operations such as:
 
-Order lines have stable session-local IDs. Explicit serving edits can split a line;
-identical lines group only for display. Replacements start from the destination
-item's Menu defaults and do not inherit source options, extras, or instructions.
+- `add_item`
+- `update_item`
+- `change_quantity`
+- `remove_item`
+- `show_menu`
+- `show_draft`
+- `propose_submission`
+- `submit_order`
 
-Checkout requires an exact Python-rendered Order review and explicit Confirmation
-on a later customer turn. Any attempted edit invalidates eligibility. Python freezes
-the reviewed restaurant payload and permits one invocation per authorized attempt.
-Accepted, rejected, application-error, definitely-not-sent, and uncertain outcomes
-remain distinct. An uncertain possible dispatch permanently blocks mutation and
-resubmission in that Session.
+These operations are parsed and validated by Python before they can affect the draft.
+
+Operations emitted in the same model response are handled independently. If one operation is incomplete or invalid, other valid operations can still be applied.
+
+For example, if the customer asks for two valid burgers and a milkshake without specifying a required flavor, the burgers can be added while the customer is asked to choose the milkshake flavor.
+
+Order lines have stable IDs within a session. Editing only some servings of a line may split it into separate lines, while equivalent lines are grouped again when the draft is displayed.
+
+Before submission, the current order is rendered for review. Confirmation must arrive on a later customer turn. The restaurant payload created at review time is frozen and reused for submission so that the submitted order is exactly the one the customer reviewed.
+
+Submission failures are handled conservatively. In particular, if the application cannot determine whether the restaurant received the request, the session is marked as uncertain and further submission attempts are blocked to avoid duplicate orders.
 
 ## Architecture
 
-- `agent.py` is the public synchronous facade. It owns one `Session`, creates a
-  fresh `TurnProcessor` for every valid message, projects actual MCP attempts into
-  the public response, and records exactly one JSONL turn.
-- `session.py` owns persistent Draft, transcript, review, receipt, submission
-  disposition, revision, and stable line identity.
-- `turn_processor.py` owns the bounded per-turn model/tool/Outcome loop, commits
-  valid Draft candidates independently, and enforces review and submission policy.
-- `tool_protocol.py` is the strict version-1 contract used to generate advertised
-  schemas and parse model calls. Unknown tools, extra fields, and invalid types are
-  `MALFORMED` before deterministic handlers execute.
-- `draft_operations.py` contains pure candidate validators and typed remedies.
-- `mistral_adapter.py` translates application-owned messages and schemas to the
-  Mistral tool-calling API. Provider objects never enter `Session`.
-- `submission.py` makes one bounded MCP attempt using a fresh session, validates
-  the advertised schema, includes `X-Applicant-Email`, and normalizes JSON or SSE
-  results without automatic retry.
-- `turn_logging.py` writes best-effort, append-only, redacted JSONL.
+- `main.py` — command-line interface.
+- `agent.py` — public synchronous API and top-level turn handling.
+- `session.py` — persistent draft, transcript, review, and submission state.
+- `turn_processor.py` — orchestrates model calls, tool execution, and turn-level policy.
+- `tool_protocol.py` — tool schemas, typed operations, outcomes, and protocol parsing.
+- `draft_operations.py` — pure validation and draft-edit logic.
+- `order.py` — menu validation, pricing, order rendering, and restaurant payload construction.
+- `model_adapter.py` — model_adapter.py defines the generic message types, tool descriptions, and model API that the rest of the application uses, without depending on Mistral-specific classes.
+- `mistral_adapter.py` — translates between application types and the Mistral SDK.
+- `mistral_support.py` — Mistral configuration, client setup, and retry/error handling.
+- `submission.py` — MCP `submit_order` integration and submission result handling.
+- `turn_logging.py` — redacted JSONL logging.
 
-The model cannot mutate the Draft, price an order, construct the restaurant
-payload, or claim a submission succeeded. Customer-visible deterministic review,
-receipt, rejection, and uncertainty messages override model prose.
+The main design choice is to use the LLM for language understanding while keeping state changes, pricing, validation, and submission decisions in deterministic Python code.
 
-For deterministic tests, inject an application-owned `TurnModel`:
+The model and submission layer are both injectable, which keeps the core behavior easy to test without network access:
 
 ```python
-agent = FoodOrderAgent(model=scripted_model, submitter=controlled_submitter)
+agent = FoodOrderAgent(
+    model=scripted_model,
+    submitter=controlled_submitter,
+)
 ```
 
-`TurnModel.complete(messages=..., tools=...)` receives the bounded transcript and
-versioned tool specifications and returns an `AssistantMessage`. Submission
-remains independently injectable through `Submitter.submit(payload)`.
+## Logging
 
-## Logging and privacy
+Turn logs are written to `logs/turns.jsonl` by default.
 
-Each JSONL record includes protocol version, session and turn IDs, customer input,
-customer-visible response, ordered raw model calls, validated operations, parse
-failures, structured Outcomes, commit effects, before/after totals and checkout
-state, model-call usage, elapsed time, error category, and actual MCP disposition.
+Each record includes information such as:
 
-Logs exclude provider objects, HTTP headers, hidden reasoning, internal Draft
-candidates, and exception text. The configured `MISTRAL_API_KEY` is redacted if
-it appears in logged text. Logging failure emits a fixed sanitized stderr message
-and never changes a known customer or restaurant outcome.
+- customer input and response
+- model tool calls
+- parsed operations and outcomes
+- state changes and totals
+- submission attempts
+- timing and error information
+
+Known API keys, authorization-related fields, bearer tokens, and other sensitive values are redacted before the record is written.
+
+Logging is best-effort: a logging failure does not change the result of the conversation.
 
 ## Verification
+
+Run the type checker and tests with:
 
 ```sh
 uv run --locked mypy
 uv run --locked pytest
 ```
 
-The default suite is network-free. It uses scripted model responses and controlled
-MCP transports. Live Mistral interpretation is opt-in and is not evidence supplied
-by the deterministic suite.
+The default test suite is network-free. Model responses and MCP transports are replaced with controlled test doubles.
